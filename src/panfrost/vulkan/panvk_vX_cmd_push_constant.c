@@ -28,12 +28,13 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
    if (!push_uniforms->gpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   struct panvk_common_sysvals_inner common_inner = {
-      .printf_buffer_address = dev->printf.bo->addr.dev,
+   struct panvk_common_sysvals_inner common_inner;
+   memcpy(&common_inner, &sysvals[SYSVALS_COMMON_START],
+          sizeof(common_inner));
+   common_inner.printf_buffer_address = dev->printf.bo->addr.dev;
 #if PAN_ARCH < 9
-      .constant_data = panvk_priv_mem_dev_addr(shader->data_mem),
+   common_inner.constant_data = panvk_priv_mem_dev_addr(shader->data_mem);
 #endif
-   };
    uint64_t *common = (uint64_t *)&common_inner;
 
    uint64_t *push_consts = cmdbuf->state.push_constants.data;
@@ -102,7 +103,10 @@ panvk_per_arch(CmdPushConstants2KHR)(
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
 
-   if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_VERTEX_BIT)
+   if (pPushConstantsInfo->stageFlags &
+       (VK_SHADER_STAGE_VERTEX_BIT |
+        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT))
       gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
 
    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT)

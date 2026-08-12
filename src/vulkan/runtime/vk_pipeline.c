@@ -2035,6 +2035,25 @@ vk_create_graphics_pipeline(struct vk_device *device,
       vk_find_struct_const(pCreateInfo->pNext,
                            PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
 
+   /* EXPERIMENTAL: DXVK 2.x links a VK_NULL_HANDLE library when building one
+    * of the libraries failed (DxvkGraphicsPipeline::createBasePipeline). That
+    * is invalid usage, but dereferencing it kills the game; fail the link so
+    * the app sees an error instead. PANVK_V9_ALLOW_TESS_GS=1 skips the check
+    * (negative control, together with the panvk stage guard).
+    */
+   const VkPipelineLibraryCreateInfoKHR *null_check_libs =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           PIPELINE_LIBRARY_CREATE_INFO_KHR);
+   if (null_check_libs && !getenv("PANVK_V9_ALLOW_TESS_GS")) {
+      for (uint32_t i = 0; i < null_check_libs->libraryCount; i++) {
+         if (null_check_libs->pLibraries[i] == VK_NULL_HANDLE) {
+            mesa_logw_once("vk_pipeline: pLibraries[%u] is VK_NULL_HANDLE, "
+                           "failing the pipeline link", i);
+            return VK_ERROR_UNKNOWN;
+         }
+      }
+   }
+
    struct vk_graphics_pipeline *pipeline =
       vk_pipeline_zalloc(device, &vk_graphics_pipeline_ops,
                          VK_PIPELINE_BIND_POINT_GRAPHICS,

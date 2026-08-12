@@ -8,6 +8,20 @@
 #include "panvk_event.h"
 
 #include "vk_log.h"
+#include "panvk_physical_device.h"
+
+#include "util/u_atomic.h"
+
+static inline bool
+panvk_event_dev_is_kbase(const struct panvk_device *device)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   return to_panvk_physical_device(device->vk.physical)->kbase_node_path[0] !=
+          '\0';
+#else
+   return false;
+#endif
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(CreateEvent)(VkDevice _device,
@@ -20,6 +34,13 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
       &device->vk, pAllocator, sizeof(*event), VK_OBJECT_TYPE_EVENT);
    if (!event)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   if (panvk_event_dev_is_kbase(device)) {
+      event->kbase = true;
+      p_atomic_set(&event->kbase_set, 0);
+      *pEvent = panvk_event_to_handle(event);
+      return VK_SUCCESS;
+   }
 
    struct drm_syncobj_create create = {
       .flags = 0,
@@ -46,8 +67,10 @@ panvk_per_arch(DestroyEvent)(VkDevice _device, VkEvent _event,
    if (!event)
       return;
 
-   struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
-   pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+   if (!event->kbase) {
+      struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
+      pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+   }
 
    vk_object_free(&device->vk, pAllocator, event);
 }
@@ -58,6 +81,9 @@ panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
    bool signaled;
+
+   if (event->kbase)
+      return p_atomic_read(&event->kbase_set) ? VK_EVENT_SET : VK_EVENT_RESET;
 
    struct drm_syncobj_wait wait = {
       .handles = (uintptr_t)&event->syncobj,
@@ -86,6 +112,11 @@ panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
+   if (event->kbase) {
+      p_atomic_set(&event->kbase_set, 1);
+      return VK_SUCCESS;
+   }
+
    struct drm_syncobj_array objs = {
       .handles = (uint64_t)(uintptr_t)&event->syncobj,
       .count_handles = 1};
@@ -107,6 +138,11 @@ panvk_per_arch(ResetEvent)(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
+
+   if (event->kbase) {
+      p_atomic_set(&event->kbase_set, 0);
+      return VK_SUCCESS;
+   }
 
    struct drm_syncobj_array objs = {
       .handles = (uint64_t)(uintptr_t)&event->syncobj,

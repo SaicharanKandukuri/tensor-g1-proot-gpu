@@ -1795,7 +1795,8 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
        !wsi_device->x11.ignore_suboptimal)
       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
 
-   xshmfence_reset(image->shm_fence);
+   if (image->shm_fence)
+      xshmfence_reset(image->shm_fence);
 
    if (!chain->base.image_info.explicit_sync) {
       ++chain->sent_image_count;
@@ -2678,7 +2679,29 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
    }
    image->pixmap = xcb_generate_id(chain->conn);
 
-   if (image->base.drm_modifier != DRM_FORMAT_MOD_INVALID) {
+   if (chain->base.wsi->x11.use_raw_fd_modifier) {
+      /* Termux:X11 and Winlator X Server use 1274 as a private marker for a
+       * directly mmap-able raw FD.  This is deliberately not advertised as
+       * a real DRM format modifier.
+       */
+      assert(image->base.num_planes == 1);
+      int fd = os_dupfd_cloexec(image->base.dma_buf_fd);
+      if (fd == -1)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+      cookie =
+         xcb_dri3_pixmap_from_buffers_checked(chain->conn,
+                                              image->pixmap,
+                                              chain->window,
+                                              1,
+                                              pCreateInfo->imageExtent.width,
+                                              pCreateInfo->imageExtent.height,
+                                              image->base.row_pitches[0],
+                                              image->base.offsets[0],
+                                              0, 0, 0, 0, 0, 0,
+                                              chain->depth, bpp,
+                                              1274, &fd);
+   } else if (image->base.drm_modifier != DRM_FORMAT_MOD_INVALID) {
       /* If the image has a modifier, we must have DRI3 v1.2. */
       assert(chain->has_dri3_modifiers);
 
@@ -2737,6 +2760,13 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
       free(error);
       goto fail_image;
    }
+
+   /* Termux:X11's raw-FD path does not support DRI3 FenceFromFD.  Present
+    * IdleNotify events still gate image reuse, and the driver waits for GPU
+    * completion before queueing the pixmap.
+    */
+   if (chain->base.wsi->x11.use_raw_fd_modifier)
+      return VK_SUCCESS;
 
 #ifdef HAVE_DRI3_EXPLICIT_SYNC
    if (chain->base.image_info.explicit_sync) {
@@ -2802,9 +2832,12 @@ x11_image_finish(struct x11_swapchain *chain,
    xcb_void_cookie_t cookie;
    if (!chain->base.wsi->sw || chain->has_mit_shm) {
 #ifdef HAVE_X11_DRM
-      cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
-      xcb_discard_reply(chain->conn, cookie.sequence);
-      xshmfence_unmap_shm(image->shm_fence);
+      if (image->sync_fence != XCB_NONE) {
+         cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
+         xcb_discard_reply(chain->conn, cookie.sequence);
+      }
+      if (image->shm_fence)
+         xshmfence_unmap_shm(image->shm_fence);
 #endif
 
       cookie = xcb_free_pixmap(chain->conn, image->pixmap);
@@ -3234,6 +3267,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
          .same_gpu = wsi_x11_check_dri3_compatible(wsi_device, conn),
          .explicit_sync =
 #ifdef HAVE_DRI3_EXPLICIT_SYNC
+            !wsi_device->x11.use_raw_fd_modifier &&
             wsi_conn->has_dri3_explicit_sync &&
             (present_caps & XCB_PRESENT_CAPABILITY_SYNCOBJ) &&
             wsi_device_supports_explicit_sync(wsi_device),

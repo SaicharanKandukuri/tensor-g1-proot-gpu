@@ -13,6 +13,7 @@
 #include "pan_image.h"
 #include "pan_props.h"
 #include "pan_util.h"
+#include "pan_v9_trace.h"
 
 static unsigned
 pan_bytes_per_pixel_tib(enum pipe_format format)
@@ -702,6 +703,7 @@ emit_rts(const struct pan_fb_desc_info *info,
 
    uint32_t tile_rt_offset_B = 0;
    for (unsigned rt = 0; rt < fb->rt_count; rt++) {
+      PAN_V9_TRACE( "[PANVK_DEBUG_RTFMT] rt=%u fmt=%d rt_count=%u\n", rt, fb->rt_formats[rt], fb->rt_count);
       if (pan_format_is_yuv(fb->rt_formats[rt])) {
          emit_yuv_rt_desc(info, ct, rt, tile_rt_offset_B, (void *)rts);
       } else {

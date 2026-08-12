@@ -33,6 +33,27 @@
 
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
+#include "pan_v9_trace.h"
+
+static void
+panvk_debug_dump_blob(const char *name, const void *ptr, size_t size,
+                      uint64_t gpu)
+{
+   const uint8_t *b = ptr;
+
+   PAN_V9_TRACE( "[PANVK_DEBUG_%s] gpu=0x%llx size=%zu\\n",
+           name, (unsigned long long)gpu, size);
+
+   for (size_t row = 0; row < size; row += 16) {
+      PAN_V9_TRACE( "[PANVK_DEBUG_%s] +%03zu:", name, row);
+      size_t end = row + 16 < size ? row + 16 : size;
+
+      for (size_t i = row; i < end; i++)
+         PAN_V9_TRACE( " %02x", b[i]);
+
+      PAN_V9_TRACE( "\\n");
+   }
+}
 
 static VkResult
 panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
@@ -61,6 +82,10 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
 
    pan_jc_add_job(&batch->frag_jc, MALI_JOB_TYPE_FRAGMENT, false, false, 0, 0,
                   &job_ptr, false);
+
+   panvk_debug_dump_blob("FRAGJOB", job_ptr.cpu,
+                         pan_size(FRAGMENT_JOB), job_ptr.gpu);
+
    util_dynarray_append(&batch->jobs, job_ptr.cpu);
    return VK_SUCCESS;
 }
@@ -180,7 +205,16 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
          fbd_info.layer = layer_id;
          fbd_info.frame_shaders = fs;
-         fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
+         /* Bifrost has one set of pre/post frame DCDs per layer. v9 has one
+          * set for all layers (alloc_pre_post_dcds() allocates 3 * 1 and the
+          * frame shader reads the layer from the FBD frame argument), so on
+          * v9 the per-layer offset pointed past the allocation. That went
+          * unnoticed while only layer 0 received geometry: the preload runs
+          * in "intersect" mode, i.e. only on tiles with primitives. With
+          * layered rendering, the fragment job of layer 1 was TERMINATED
+          * (CTS indirect_draw_multiview, multiview.masks with LOAD). */
+         if (PAN_ARCH < 9 || getenv("PANVK_V9_DCD_PER_LAYER"))
+            fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
 
          const struct pan_fb_descs fb_descs = {
             .fbd = fbd.cpu,
@@ -190,6 +224,13 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
                               : fbd.cpu + pan_size(FRAMEBUFFER),
          };
          tagged_fbd_ptr |= GENX(pan_emit_fb_desc)(&fbd_info, &fb_descs);
+
+         panvk_debug_dump_blob("FBD", fbd.cpu,
+                               batch->fb.desc_stride, fbd.gpu);
+         PAN_V9_TRACE(
+                 "[PANVK_DEBUG_FBD] tagged_ptr=0x%llx stride=%u\n",
+                 (unsigned long long)tagged_fbd_ptr,
+                 batch->fb.desc_stride);
 
          result = panvk_cmd_prepare_fragment_job(cmdbuf, tagged_fbd_ptr);
          if (result != VK_SUCCESS)
@@ -292,6 +333,25 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
       cfg.sample_pattern = pan_sample_pattern(fb->sample_count);
+#if PAN_ARCH >= 9
+      /* Valhall selects the provoking vertex in the tiler context rather than
+       * per-draw. jm_emit_tiler_desc() in src/gallium/drivers/panfrost/pan_jm.c
+       * sets this under the same #if; without it the tiler uses the wrong
+       * winding for the first vertex. */
+      cfg.first_provoking_vertex =
+         cmdbuf->state.gfx.render.first_provoking_vertex == U_TRISTATE_YES;
+#endif
+   }
+
+   {
+      PAN_V9_TRACE( "[PANVK_DEBUG_TILERCTX] 192 byte Tiler Context desc:");
+      uint8_t *tcb = (uint8_t *)&batch->tiler.ctx_templ;
+      for (int i = 0; i < 192; i++) PAN_V9_TRACE( " %02x", tcb[i]);
+      PAN_V9_TRACE( "\n");
+      PAN_V9_TRACE( "[PANVK_DEBUG_TILERHEAP] 32 byte Tiler Heap desc:");
+      uint8_t *thb = (uint8_t *)&batch->tiler.heap_templ;
+      for (int i = 0; i < 32; i++) PAN_V9_TRACE( " %02x", thb[i]);
+      PAN_V9_TRACE( "\n");
    }
 
    memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
@@ -308,10 +368,20 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    }
 
 out_set_layer_ctx:
-   if (PAN_ARCH >= 9)
+   if (PAN_ARCH >= 9) {
       batch->tiler.ctx.valhall.desc = tiler_desc;
-   else
+      /* JM v9 uses one tiler context per layer and drops the hardware layer
+       * write (lower_layer_writes), so every primitive lands in internal
+       * layer 0 of its own context. The FBD picks the primitive list with
+       * internal_layer_index = layer - layer_offset (pan_emit_fbd), which
+       * must therefore be 0. With layer_offset left at 0 the fragment job of
+       * layer N read list N of a one-layer context: empty for N = 1, and the
+       * job was TERMINATED for N >= 2. */
+      assert(layer_idx <= UINT8_MAX);
+      batch->tiler.ctx.valhall.layer_offset = layer_idx;
+   } else {
       batch->tiler.ctx.bifrost.desc = tiler_desc;
+   }
 
    return VK_SUCCESS;
 }

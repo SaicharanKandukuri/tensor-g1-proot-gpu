@@ -20,6 +20,10 @@
 #include "panvk_utrace_perfetto.h"
 
 #include "kmod/pan_kmod.h"
+#include "kmod/panthor_kmod.h"
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
 #include "util/perf/u_trace.h"
 
 #include "util/simple_mtx.h"
@@ -77,6 +81,7 @@ struct panvk_device {
    } kmod;
 
    struct panvk_priv_bo *tiler_heap;
+   struct panvk_priv_bo *poly_heap;
    struct panvk_priv_bo *indirect_varying_buffer;
    struct panvk_priv_bo *sample_positions;
 
@@ -148,6 +153,40 @@ static inline struct panvk_device *
 to_panvk_device(struct vk_device *dev)
 {
    return container_of(dev, struct panvk_device, vk);
+}
+
+/* CSF interface information, sourced from the panthor uAPI or from the
+ * kbase GLB interface depending on which backend the device came from.
+ * Always use this instead of calling panthor_kmod_get_csif_props()
+ * directly, which reads garbage on a kbase device. */
+static inline const struct drm_panthor_csif_info *
+panvk_get_csif_props(const struct panvk_device *dev)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   if (phys_dev->kbase_node_path[0])
+      return kbase_kmod_get_csif_props(dev->kmod.dev);
+#endif
+
+   return panthor_kmod_get_csif_props(dev->kmod.dev);
+}
+
+/* Latest cache-flush ID, sourced from the panthor uAPI or the kbase CSF
+ * USER register page depending on which backend the device came from. */
+static inline uint32_t
+panvk_get_flush_id(const struct panvk_device *dev)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   if (phys_dev->kbase_node_path[0])
+      return kbase_kmod_get_flush_id(dev->kmod.dev);
+#endif
+
+   return panthor_kmod_get_flush_id(dev->kmod.dev);
 }
 
 static inline void

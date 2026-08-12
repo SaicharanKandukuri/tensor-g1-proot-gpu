@@ -58,6 +58,34 @@ struct panvk_cs_sync64 {
    uint32_t pad;
 };
 
+enum panvk_kbase_progress_marker {
+   PANVK_KBASE_PROGRESS_CMDBUF_START = 0x001,
+
+   PANVK_KBASE_PROGRESS_VT_BEFORE_RUN_IDVS = 0x110,
+   PANVK_KBASE_PROGRESS_VT_AFTER_RUN_IDVS = 0x120,
+   PANVK_KBASE_PROGRESS_VT_BEFORE_FINISH_TILING = 0x200,
+   PANVK_KBASE_PROGRESS_VT_AFTER_FINISH_TILING = 0x210,
+   PANVK_KBASE_PROGRESS_VT_AFTER_VT_END = 0x220,
+   PANVK_KBASE_PROGRESS_VT_AFTER_SYNC_SIGNAL = 0x230,
+
+   PANVK_KBASE_PROGRESS_FRAG_ENTER = 0x300,
+   PANVK_KBASE_PROGRESS_FRAG_BEFORE_TILING_WAIT = 0x310,
+   PANVK_KBASE_PROGRESS_FRAG_AFTER_TILING_WAIT = 0x320,
+   PANVK_KBASE_PROGRESS_FRAG_BEFORE_RUN = 0x330,
+   PANVK_KBASE_PROGRESS_FRAG_AFTER_RUN = 0x340,
+   PANVK_KBASE_PROGRESS_FRAG_AFTER_FINISH = 0x350,
+
+   PANVK_KBASE_PROGRESS_COMPUTE_ENTER = 0x400,
+   PANVK_KBASE_PROGRESS_COMPUTE_BEFORE_ITER = 0x410,
+   PANVK_KBASE_PROGRESS_COMPUTE_BEFORE_RUN = 0x420,
+   PANVK_KBASE_PROGRESS_COMPUTE_AFTER_RUN = 0x430,
+   PANVK_KBASE_PROGRESS_COMPUTE_AFTER_SIGNAL = 0x440,
+
+   PANVK_KBASE_PROGRESS_FINISH_BEFORE_WAIT = 0xf00,
+   PANVK_KBASE_PROGRESS_FINISH_AFTER_WAIT = 0xf10,
+   PANVK_KBASE_PROGRESS_CMDBUF_DONE = 0xff0,
+};
+
 struct panvk_cs_desc_ringbuf {
    uint64_t syncobj;
    uint64_t ptr;
@@ -197,6 +225,7 @@ struct panvk_cs_subqueue_context {
       struct {
          uint64_t cs;
       } tracebuf;
+      uint64_t kbase_progress_addr;
    } debug;
    /* Non-zero when draws should execute, zero when they should be
     * skipped. Written by the primary before cs_call, read by inherited
@@ -550,6 +579,7 @@ struct panvk_cond_render_state {
 struct panvk_cmd_buffer {
    struct vk_command_buffer vk;
    VkCommandBufferUsageFlags flags;
+   enum mali_cs_sync_scope sync_scope;
    struct panvk_pool cs_pool;
    struct panvk_pool desc_pool;
    struct panvk_pool tls_pool;
@@ -566,6 +596,10 @@ struct panvk_cmd_buffer {
       struct panvk_cs_state cs[PANVK_SUBQUEUE_COUNT];
       struct panvk_tls_state tls;
       bool contains_timestamp_queries;
+      bool uses_poly_heap;
+      /* CPU-side estimate used by the kbase queue to choose a conservative
+       * tiler-heap renewal cadence. */
+      uint64_t tiler_work_estimate;
 
       struct panvk_cond_render_state cond_render;
    } state;
@@ -1000,6 +1034,10 @@ vk_stages_to_subqueue_mask(VkPipelineStageFlags2 vk_stages,
 
 void panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
                                   struct panvk_cs_deps deps);
+
+void panvk_per_arch(kbase_mark_progress)(
+   struct panvk_cmd_buffer *cmdbuf, enum panvk_subqueue_id subqueue,
+   enum panvk_kbase_progress_marker marker);
 
 #if PAN_ARCH >= 14
 static inline void

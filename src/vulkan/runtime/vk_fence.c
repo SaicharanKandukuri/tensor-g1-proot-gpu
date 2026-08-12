@@ -364,6 +364,11 @@ vk_common_ImportFenceFdKHR(VkDevice _device,
    if (pImportFenceFdInfo->flags & VK_FENCE_IMPORT_TEMPORARY_BIT) {
       const struct vk_sync_type *sync_type =
          get_fence_sync_type(device->physical, handle_type);
+      if (sync_type == NULL) {
+         return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                          "No sync type supports importing handle type 0x%x",
+                          handle_type);
+      }
 
       VkResult result = vk_sync_create(device, sync_type, 0 /* flags */,
                                        0 /* initial_value */, &temporary);

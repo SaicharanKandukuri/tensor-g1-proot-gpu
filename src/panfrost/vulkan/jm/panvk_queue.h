@@ -16,9 +16,13 @@
 
 #include "vk_queue.h"
 
+struct panvk_kbase_jm;
+
 struct panvk_gpu_queue {
    struct vk_queue vk;
    uint32_t sync;
+   /* kbase JM submission and completion state (panvk_vX_gpu_queue.c). */
+   struct panvk_kbase_jm *kjm;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

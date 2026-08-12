@@ -65,6 +65,70 @@ panvk_storage_pview(const struct panvk_image_view *view,
    return spview;
 }
 
+#if PAN_ARCH == 9
+/* v9 LD_TEX/LEA_TEX cannot address the samples of a 2D multisampled texture
+ * descriptor: a sample index >= 1 is out of bounds (loads return 0, stores
+ * are dropped), and with an array the R coordinate selects the layer.
+ * Described as a 3D texture, one slice per (layer, sample), every sample is
+ * addressed where the render target puts it: pan_layout already lays a
+ * multisampled image out as samples x surface stride, and a layer is exactly
+ * samples x surface stride. The sample count goes in the Array size field,
+ * which 3D textures do not use, for panvk_v9_lower_image_ms() to fold
+ * z = layer * samples + sample, and the plane (the view's first layer) is
+ * sized to cover all its layers, since 3D accesses are bounded by the plane
+ * size. PANVK_V9_MS_STORAGE_2D=1 keeps the 2D multisampled descriptor (A/B
+ * control).
+ */
+static bool
+panvk_v9_ms_storage_2d(void)
+{
+   static int ms_2d = -1;
+   if (ms_2d < 0)
+      ms_2d = getenv("PANVK_V9_MS_STORAGE_2D") != NULL;
+   return ms_2d;
+}
+
+static void
+panvk_v9_storage_ms_as_3d(const struct panvk_image_view *view,
+                          struct mali_texture_packed *desc, void *payload)
+{
+   const struct panvk_image *image =
+      container_of(view->vk.image, struct panvk_image, vk);
+   const unsigned samples = image->vk.samples;
+
+   if (samples <= 1 || panvk_v9_ms_storage_2d())
+      return;
+
+   const struct pan_image_plane *plane = &image->planes[0].plane;
+   ASSERTED const uint64_t surface_stride_B =
+      plane->layout.slices[0].tiled_or_linear.surface_stride_B;
+   assert(image->vk.mip_levels == 1);
+   assert(image->vk.array_layers == 1 ||
+          plane->layout.array_stride_B == samples * surface_stride_B);
+
+   pan_unpack(desc, TEXTURE, tex);
+   assert(tex.dimension == MALI_TEXTURE_DIMENSION_2D);
+
+   pan_pack(desc, TEXTURE, cfg) {
+      cfg = tex;
+      cfg.dimension = MALI_TEXTURE_DIMENSION_3D;
+      cfg.sample_count = 1;
+      cfg.depth = tex.array_size * samples;
+      cfg.array_size = samples;
+   }
+
+   if (tex.array_size > 1) {
+      struct mali_generic_plane_packed *gplane = payload;
+      pan_unpack(gplane, GENERIC_PLANE, p);
+      assert(p.plane_type == MALI_PLANE_TYPE_GENERIC);
+      pan_pack(gplane, GENERIC_PLANE, cfg) {
+         cfg = p;
+         cfg.size = tex.array_size * plane->layout.array_stride_B;
+      }
+   }
+}
+#endif
+
 static VkResult
 prepare_tex_descs(struct panvk_image_view *view)
 {
@@ -165,6 +229,10 @@ prepare_tex_descs(struct panvk_image_view *view)
                struct pan_image_view spview = panvk_storage_pview(view, &pview);
                GENX(pan_storage_texture_emit)(
                   &spview, &view->descs.storage_tex[plane], &storage_ptr);
+#if PAN_ARCH == 9
+               panvk_v9_storage_ms_as_3d(view, &view->descs.storage_tex[plane],
+                                         storage_ptr.cpu);
+#endif
                storage_ptr = pan_ptr_offset(storage_ptr, tex_payload_size);
             }
 #endif
@@ -178,6 +246,10 @@ prepare_tex_descs(struct panvk_image_view *view)
             struct pan_image_view spview = panvk_storage_pview(view, &pview);
             GENX(pan_storage_texture_emit)(&spview, &view->descs.storage_tex[0],
                                            &storage_ptr);
+#if PAN_ARCH == 9
+            panvk_v9_storage_ms_as_3d(view, &view->descs.storage_tex[0],
+                                      storage_ptr.cpu);
+#endif
          }
 #endif
       }

@@ -177,6 +177,39 @@ panvk_sampler_fill_desc(const struct VkSamplerCreateInfo *info,
       cfg.reduction_mode = panvk_translate_reduction_mode(reduction_mode);
 #endif
    }
+#if PAN_ARCH == 9
+   /* EXPERIMENTAL v9 min/max reduction emulation. v9 samplers have no
+    * reduction mode field, so the shader does the filtering itself (see
+    * panvk_v9_nir_lower_minmax.c) and needs the mode and the filters. They
+    * go in word 3, which v9.xml leaves undefined and which the hardware was
+    * measured not to read (filled with 0xffffffff: byte-identical texture
+    * output). Word 3 stays 0 for every WEIGHTED_AVERAGE sampler, so those
+    * are unchanged. Layout, see PANVK_V9_MINMAX_*: */
+   /* EXPERIMENTAL v9 cubic filtering (VK_EXT_filter_cubic) goes through the
+    * same emulation: the hardware has no cubic filter, the descriptor above
+    * falls back to LINEAR and the shader redoes the 4x4 Catmull-Rom
+    * footprint when word 3 is tagged. */
+   const bool cubic = mag_filter == VK_FILTER_CUBIC_EXT ||
+                      min_filter == VK_FILTER_CUBIC_EXT;
+   if (reduction_mode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE || cubic) {
+      uint32_t w3 = PANVK_V9_MINMAX_TAG;
+      if (reduction_mode == VK_SAMPLER_REDUCTION_MODE_MIN)
+         w3 |= PANVK_V9_MINMAX_MIN;
+      else if (reduction_mode == VK_SAMPLER_REDUCTION_MODE_MAX)
+         w3 |= PANVK_V9_MINMAX_MAX;
+      if (mag_filter == VK_FILTER_LINEAR)
+         w3 |= PANVK_V9_MINMAX_MAG_LINEAR;
+      if (min_filter == VK_FILTER_LINEAR)
+         w3 |= PANVK_V9_MINMAX_MIN_LINEAR;
+      if (mag_filter == VK_FILTER_CUBIC_EXT)
+         w3 |= PANVK_V9_MINMAX_MAG_CUBIC;
+      if (min_filter == VK_FILTER_CUBIC_EXT)
+         w3 |= PANVK_V9_MINMAX_MIN_CUBIC;
+      if (info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
+         w3 |= PANVK_V9_MINMAX_MIP_LINEAR;
+      ((uint32_t *)desc)[3] = w3;
+   }
+#endif
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

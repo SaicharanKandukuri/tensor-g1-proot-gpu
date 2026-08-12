@@ -46,7 +46,7 @@ typedef struct native_handle
 #endif
 } native_handle_t;
 
-typedef const native_handle_t* buffer_handle_t;
+typedef void* buffer_handle_t;
 
 /*
  * Closes the file descriptors contained in this native_handle_t, which may

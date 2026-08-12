@@ -755,8 +755,10 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
       cfg.shader.fau_count = sizeof(struct panvk_fb_sysvals) / FAU_WORD_SIZE;
       cfg.shader.fau = faus.gpu;
 #endif
+#if PAN_ARCH >= 10  /* PATCH: struct "DCD Flags 2" tidak ada di hardware v9 */
       cfg.flags_2.write_mask = rt_written;
       cfg.flags_2.read_mask = rt_read;
+#endif
 #if PAN_ARCH >= 11
       cfg.flags_2.no_shader_depth_read =
          !(locations_read & BITFIELD_BIT(FRAG_RESULT_DEPTH));

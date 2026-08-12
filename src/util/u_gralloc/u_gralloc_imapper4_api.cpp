@@ -13,6 +13,7 @@
 #include <aidl/android/hardware/graphics/common/ExtendableType.h>
 #include <aidl/android/hardware/graphics/common/PlaneLayoutComponent.h>
 #include <aidl/android/hardware/graphics/common/PlaneLayoutComponentType.h>
+#include <android/binder_manager.h>
 #include <gralloctypes/Gralloc4.h>
 #include <system/window.h>
 
@@ -296,6 +297,17 @@ mapper4_get_front_rendering_usage(struct u_gralloc *gralloc,
 {
    assert(out_usage);
 #if ANDROID_API_LEVEL >= 33
+   /* FRONT_BUFFER is an AIDL BufferUsage bit ("gralloc 4.1"). libui's Gralloc4
+    * accepts it only when the AIDL IAllocator is declared (hasIAllocatorAidl()
+    * in frameworks/native/libs/ui/Gralloc4.cpp); with only the HIDL
+    * allocator@4.0, every allocation asking for it fails ("buffer descriptor
+    * contains invalid usage bits 0x100000000", measured on MT6789), and with
+    * it the shared-presentable swapchains it is offered for. */
+   static const bool aidl_allocator = AServiceManager_isDeclared(
+      "android.hardware.graphics.allocator.IAllocator/default");
+   if (!aidl_allocator)
+      return -ENOTSUP;
+
    *out_usage = static_cast<uint64_t>(BufferUsage::FRONT_BUFFER);
 
    return 0;

@@ -11,6 +11,7 @@
  */
 
 #include "genxml/gen_macros.h"
+#include "pan_v9_trace.h"
 
 #include "panvk_buffer.h"
 #include "panvk_cmd_alloc.h"
@@ -23,6 +24,15 @@
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_image_view.h"
+
+/* PATCH: seluruh jalur draw grafis (vertex/tiler/fragment) di file ini masih
+ * ditulis untuk Bifrost (RENDERER_STATE/rsd, dst) dan BELUM diadaptasi untuk
+ * v9/Valhall -- itu pekerjaan porting terpisah yang jauh lebih besar dari
+ * compute. Untuk PAN_ARCH >= 9, kode asli di-skip dan diganti stub kosong
+ * (lihat #else di akhir file) supaya libvulkan_panfrost.so bisa selesai
+ * di-link dan compute (yang sudah diadaptasi di jm_panvk_vX_cmd_dispatch.c)
+ * bisa divalidasi malam ini. Draw call APA PUN lewat jalur ini akan
+ * no-op/gagal untuk v9 sampai porting grafisnya dikerjakan. */
 #include "panvk_instance.h"
 #include "panvk_meta.h"
 #include "panvk_priv_bo.h"
@@ -45,7 +55,9 @@ struct panvk_draw_data {
    struct panvk_draw_info info;
    unsigned vertex_range;
    unsigned padded_vertex_count;
+#if PAN_ARCH < 9
    struct mali_invocation_packed invocation;
+#endif
    struct {
       uint64_t varyings;
       uint64_t attributes;
@@ -65,6 +77,12 @@ struct panvk_draw_data {
    uint64_t fb;
    const struct pan_tiler_context *tiler_ctx;
    uint64_t viewport;
+   /* PATCH v9: blend descriptor dialokasikan & diisi LEBIH AWAL (sebelum
+    * cmd_prepare_draw_sysvals/push-uniforms) - root cause "clear-only"
+    * (ditemukan komunitas): FAU sempat kebawa nilai blend_descs[] basi
+    * krn ke-baca sysval sebelum blend_emit_descs() sempat jalan. */
+   struct pan_ptr blend_ptr;
+   uint32_t bd_count;
    struct {
       struct pan_ptr vertex_copy_desc;
       struct pan_ptr frag_copy_desc;
@@ -89,6 +107,8 @@ is_indirect_draw(const struct panvk_draw_data *draw)
    return draw->info.indirect.buffer_dev_addr != 0 ||
           draw->info.index.index_size != 0;
 }
+
+#if PAN_ARCH < 9 /* PATCH: guard digeser ke sini, struct+includes di atas jadi unconditional */
 
 static bool
 has_depth_att(struct panvk_cmd_buffer *cmdbuf)
@@ -1955,3 +1975,1656 @@ panvk_per_arch(CmdEndRendering2KHR)(
       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
    }
 }
+
+#else /* PAN_ARCH >= 9 -- lihat catatan PATCH di awal file */
+
+#include "pan_encoder.h" /* PATCH: aslinya cuma ke-include dalam blok <9 */
+
+/* PATCH v9 -- BAGIAN 1: disalin verbatim dari csf/panvk_vX_cmd_draw.c
+ * (v10+, production-tested). Dikonfirmasi 100% CPU-only, nol dependensi
+ * cs_* (command-stream builder CSF-only) -- portable ke JM/v9 tanpa
+ * modifikasi struktural. Belum dipanggil dari mana pun (CmdDraw masih
+ * stub di bawah) -- ini baru memvalidasi bagian ini compile bersih
+ * berdiri sendiri, sebelum disambung ke job encoding draw yang sebenarnya. */
+
+static void
+emit_vs_attrib(struct panvk_cmd_buffer *cmdbuf,
+               uint32_t attrib_idx, uint32_t vb_desc_offset,
+               struct mali_attribute_packed *desc)
+{
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   const struct vk_vertex_input_state *vi = dyns->vi;
+   const struct vk_vertex_attribute_state *attrib_info =
+      &vi->attributes[attrib_idx];
+   const struct vk_vertex_binding_state *buf_info =
+      &vi->bindings[attrib_info->binding];
+   const uint32_t stride = dyns->vi_binding_strides[attrib_info->binding];
+   bool per_instance = buf_info->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+   enum pipe_format f = vk_format_to_pipe_format(attrib_info->format);
+   unsigned buf_idx = vb_desc_offset + attrib_info->binding;
+
+   pan_pack(desc, ATTRIBUTE, cfg) {
+      cfg.offset = attrib_info->offset;
+
+      if (per_instance)
+         cfg.offset += cmdbuf->state.gfx.vi.base_instance * stride;
+
+      cfg.format = GENX(pan_format_from_pipe_format)(f)->hw;
+      cfg.table = 0;
+      cfg.buffer_index = buf_idx;
+      cfg.stride = stride;
+      if (!per_instance) {
+         /* Per-vertex */
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
+         cfg.offset_enable = true;
+      } else if (buf_info->divisor == 1) {
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+      } else if (buf_info->divisor == 0) {
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         /* HW doesn't support a zero divisor, but we can achieve the same by
+          * not using a divisor and setting the stride to zero */
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+         cfg.stride = 0;
+      } else if (util_is_power_of_two_or_zero(buf_info->divisor)) {
+         /* Per-instance, POT divisor */
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+         cfg.divisor_r = __builtin_ctz(buf_info->divisor);
+      } else {
+         /* Per-instance, NPOT divisor */
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+         cfg.divisor_d = pan_compute_npot_divisor(
+            buf_info->divisor, &cfg.divisor_r, &cfg.divisor_e);
+      }
+   }
+}
+
+static VkResult
+prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf,
+                      const struct panvk_shader *shader,
+                      struct panvk_shader_desc_state *shader_desc_state,
+                      uint32_t repeat_count)
+{
+   const struct panvk_shader_desc_info *vs_desc_info =
+      &shader->desc_info;
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   const struct vk_vertex_input_state *vi = dyns->vi;
+
+   uint32_t vb_count = 0;
+   u_foreach_bit(i, vi->attributes_valid)
+      vb_count = MAX2(vi->attributes[i].binding + 1, vb_count);
+
+   uint32_t vb_offset = vs_desc_info->dyn_bufs.count + MAX_VS_ATTRIBS + 1;
+   uint32_t desc_count = vb_offset + vb_count;
+
+   const struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.gfx.desc_state;
+   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, repeat_count * desc_count * PANVK_DESCRIPTOR_SIZE,
+      PANVK_DESCRIPTOR_SIZE);
+   struct panvk_opaque_desc *descs = driver_set.cpu;
+
+   if (!driver_set.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   for (uint32_t r = 0; r < repeat_count; r++) {
+      for (uint32_t i = 0; i < MAX_VS_ATTRIBS; i++) {
+         if (vi->attributes_valid & BITFIELD_BIT(i)) {
+            emit_vs_attrib(cmdbuf, i, vb_offset,
+                           (struct mali_attribute_packed *)(&descs[i]));
+         } else {
+            /* Write a NullDescriptor and rely on OOB behavior */
+            pan_cast_and_pack(&descs[i], NULL_DESCRIPTOR, cfg)
+               ;
+         }
+      }
+
+      /* Dummy sampler always comes right after the vertex attribs. */
+      pan_cast_and_pack(&descs[MAX_VS_ATTRIBS], SAMPLER, cfg) {
+         cfg.clamp_integer_array_indices = false;
+      }
+
+      panvk_per_arch(cmd_fill_dyn_bufs)(
+         desc_state, vs_desc_info,
+         (struct mali_buffer_packed *)(&descs[MAX_VS_ATTRIBS + 1]));
+
+      for (uint32_t i = 0; i < vb_count; i++) {
+         const struct panvk_attrib_buf *vb = &cmdbuf->state.gfx.vb.bufs[i];
+         const bool nulldesc = (vb->address == 0 && vb->size == 0);
+
+         if ((vi->bindings_valid & BITFIELD_BIT(i)) && !nulldesc) {
+            pan_cast_and_pack(&descs[vb_offset + i], BUFFER, cfg) {
+               cfg.address = vb->address;
+               cfg.size = vb->size;
+            }
+         } else {
+            /* Write a NullDescriptor and rely on OOB behavior */
+            pan_cast_and_pack(&descs[vb_offset + i], NULL_DESCRIPTOR, cfg)
+               ;
+         }
+      }
+
+      descs += desc_count;
+   }
+
+   shader_desc_state->driver_set.dev_addr = driver_set.gpu;
+   shader_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   gfx_state_set_dirty(cmdbuf, DESC_STATE);
+   return VK_SUCCESS;
+}
+
+/* PATCH v9 -- BAGIAN 1b: sisi fragment dari driver set, plus pengisi
+ * res_table.
+ *
+ * prepare_vs_driver_set() di atas hanya mengisi driver_set.{dev_addr,size}.
+ * Yang dibaca job adalah res_table (lihat cfg.resources /
+ * cfg.shader.resources di BAGIAN 2), dan res_table HANYA diisi oleh
+ * panvk_per_arch(cmd_prepare_shader_res_table)(). Tanpa pemanggil itu,
+ * res_table tetap 0 dan GPU membaca resource table dari alamat nol.
+ *
+ * emit_varying_descs() dan prepare_fs_driver_set() disalin verbatim dari
+ * csf/panvk_vX_cmd_draw.c (v10+), sama seperti BAGIAN 1. Keduanya CPU-only,
+ * nol dependensi cs_*. Layout driver set fragment dipaksa oleh
+ * panvk_vX_nir_lower_descriptors.c (create_copy_table(): untuk stage
+ * fragment dummy_sampler_idx = num_varying_attr_descs, lalu
+ * dyn_bufs_start = dummy_sampler_idx + 1), jadi urutan
+ * varyings -> dummy sampler -> dynamic buffers bukan pilihan bebas. */
+
+static void
+emit_varying_descs(const struct panvk_cmd_buffer *cmdbuf,
+                   struct mali_attribute_packed *descs)
+{
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
+
+   const struct pan_varying_layout *vs_layout = &vs->info.varyings.formats;
+   const struct pan_varying_layout *fs_format = &fs->info.varyings.formats;
+   pan_varying_layout_require_layout(vs_layout);
+   pan_varying_layout_require_format(fs_format);
+
+   for (uint32_t i = 0; i < fs_format->count; i++) {
+      const struct pan_varying_slot *fs_slot =
+         pan_varying_layout_slot_at(fs_format, i);
+
+      /* Skip empty slots and special varyings. */
+      if (!fs_slot || fs_slot->section != PAN_VARYING_SECTION_GENERIC)
+         continue;
+
+      unsigned offset = 0;
+      enum pipe_format format = PIPE_FORMAT_NONE;
+
+      const struct pan_varying_slot *vs_slot =
+         pan_varying_layout_find_slot(vs_layout, fs_slot->location);
+      if (vs_slot) {
+         nir_alu_type base_type = nir_alu_type_get_base_type(fs_slot->alu_type);
+         nir_alu_type bit_size = nir_alu_type_get_type_size(vs_slot->alu_type);
+
+         offset = vs_slot->offset;
+         format = pan_varying_format(base_type | bit_size, vs_slot->ncomps);
+      }
+
+      pan_pack(&descs[i], ATTRIBUTE, cfg) {
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_VERTEX_PACKET;
+         cfg.offset_enable = false;
+         cfg.format = GENX(pan_format_from_pipe_format)(format)->hw;
+         cfg.table = 61;
+         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
+         cfg.offset = 1024 + offset;
+         /* v9 has no hardware-controlled varying buffer index (that is v12+),
+          * so the buffer index stays 0 here. */
+         cfg.buffer_index = 0;
+         cfg.attribute_stride = vs_layout->generic_size_B;
+         cfg.packet_stride = vs_layout->generic_size_B + 16;
+      }
+   }
+}
+
+static VkResult
+prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_shader_desc_info *fs_desc_info =
+      &cmdbuf->state.gfx.fs.shader->desc_info;
+   struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+   const struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.gfx.desc_state;
+   /* If the shader is using LD_VAR_BUF[_IMM], we do not have to set up
+    * Attribute Descriptors for varying loads. */
+   const uint32_t desc_count = fs_desc_info->fs_varying_attr_desc_count +
+                               fs_desc_info->dyn_bufs.count + 1;
+   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
+   struct panvk_opaque_desc *descs = driver_set.cpu;
+
+   if (desc_count && !driver_set.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   if (fs_desc_info->fs_varying_attr_desc_count > 0)
+      emit_varying_descs(cmdbuf, (struct mali_attribute_packed *)(&descs[0]));
+
+   /* Dummy sampler always comes right after the varyings. */
+   const uint32_t sampler_idx = fs_desc_info->fs_varying_attr_desc_count;
+   pan_cast_and_pack(&descs[sampler_idx], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
+   }
+
+   panvk_per_arch(cmd_fill_dyn_bufs)(
+      desc_state, fs_desc_info,
+      (struct mali_buffer_packed *)(&descs[sampler_idx + 1]));
+
+   fs_desc_state->driver_set.dev_addr = driver_set.gpu;
+   fs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   gfx_state_set_dirty(cmdbuf, DESC_STATE);
+   return VK_SUCCESS;
+}
+
+/*
+ * Builds the driver set AND the resource table for both stages.
+ *
+ * repeat_count is 1 for the vertex stage: CSF keeps the base instance in a
+ * command stream register and re-emits the descriptor when it changes, but JM
+ * has no such register and cannot patch a job after it has been recorded, so
+ * emit_vs_attrib() folds the base instance into the descriptor offset and the
+ * driver set is rebuilt per draw instead of repeated.
+ */
+static VkResult
+prepare_gfx_desc(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
+   const struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.gfx.desc_state;
+   struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
+   struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+   VkResult result;
+
+   result = prepare_vs_driver_set(cmdbuf, vs, vs_desc_state, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Must come after the driver set: this is what fills res_table[0]. */
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, desc_state, &vs->desc_info, vs_desc_state, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (fs == NULL) {
+      /* No fragment shader means no fragment resources to point at. Zero it
+       * so a stale res_table from an earlier draw is not reused. */
+      memset(fs_desc_state, 0, sizeof(*fs_desc_state));
+      return VK_SUCCESS;
+   }
+
+   result = prepare_fs_driver_set(cmdbuf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   return panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, desc_state, &cmdbuf->state.gfx.fs.shader->desc_info,
+      fs_desc_state, 1);
+}
+
+/* PATCH v9 -- BAGIAN 2: isi state vertex (POSITION, Shader Environment) dan
+ * fragment (DRAW, struct Draw pendek v9) untuk Malloc Vertex Job.
+ * ADAPTASI dari panvk_emit_vertex_dcd/panvk_emit_tiler_dcd Bifrost --
+ * nama field genxml v9 dari riset kita sendiri (compute + genxml grep),
+ * BELUM tervalidasi compile. Belum dipanggil dari mana pun. */
+
+static void
+panvk_emit_vs_position_v9(struct panvk_cmd_buffer *cmdbuf,
+                          const struct panvk_draw_data *draw,
+                          struct mali_shader_environment_packed *position_section)
+{
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_desc_state *vs_desc_state =
+      &cmdbuf->state.gfx.vs.desc;
+
+   pan_pack(position_section, SHADER_ENVIRONMENT, cfg) {
+      cfg.resources = vs_desc_state->res_table;
+   /* PATCH v9: vs->spd itu alias union ke vs->spds.pos_points (field
+    * pertama union), BUKAN alamat generic yang aman dipakai selalu.
+    * Harus pilih variant SPD sesuai topology, sama seperti csf/ (baris
+    * ~1958): titik pakai pos_points, selain itu (termasuk segitiga)
+    * pakai pos_triangles. Sebelum patch ini, draw non-titik salah baca
+    * SPD dari pos_points yang kemungkinan besar tidak pernah
+    * dialokasikan -> silent wrong render, bukan crash. */
+   cfg.shader = draw->info.prim == MESA_PRIM_POINTS
+                   ? panvk_priv_mem_dev_addr(vs->spds.pos_points)
+                   : panvk_priv_mem_dev_addr(vs->spds.pos_triangles);
+      cfg.thread_storage = draw->tls;
+      cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
+      cfg.fau_count = vs->fau.total_count;
+   }
+}
+
+static enum mali_draw_mode
+translate_prim(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_POINTS:
+      return MALI_DRAW_MODE_POINTS;
+   case MESA_PRIM_LINES:
+      return MALI_DRAW_MODE_LINES;
+   case MESA_PRIM_LINE_STRIP:
+      return MALI_DRAW_MODE_LINE_STRIP;
+   case MESA_PRIM_TRIANGLES:
+      return MALI_DRAW_MODE_TRIANGLES;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      return MALI_DRAW_MODE_TRIANGLE_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return MALI_DRAW_MODE_TRIANGLE_FAN;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return MALI_DRAW_MODE_LINES_ADJACENCY;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return MALI_DRAW_MODE_LINE_STRIP_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return MALI_DRAW_MODE_TRIANGLES_ADJACENCY;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return MALI_DRAW_MODE_TRIANGLE_STRIP_ADJACENCY;
+   default:
+      UNREACHABLE("Invalid primitive type");
+   }
+}
+
+/* PATCH v9: duplikat standalone dari versi Bifrost (has_depth_att dkk,
+ * jm/panvk_vX_cmd_draw.c baris ~104-180 di dalam blok #if PAN_ARCH<9).
+ * Isinya murni logic VK-state, nol dependency hardware struct, aman
+ * dipakai v9 apa adanya -- BUKAN ditulis ulang dari nol. */
+static bool
+has_depth_att_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   return (cmdbuf->state.gfx.render.bound_attachments &
+           MESA_VK_RP_ATTACHMENT_DEPTH_BIT) != 0;
+}
+
+static bool
+has_stencil_att_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   return (cmdbuf->state.gfx.render.bound_attachments &
+           MESA_VK_RP_ATTACHMENT_STENCIL_BIT) != 0;
+}
+
+static bool
+writes_depth_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+
+   return has_depth_att_v9(cmdbuf) && ds->depth.test_enable &&
+          ds->depth.write_enable && ds->depth.compare_op != VK_COMPARE_OP_NEVER;
+}
+
+/* Copies of the Bifrost writes_stencil() / ds_test_always_passes() above,
+ * needed by the v9 early-ZS selection in panvk_emit_fs_draw_v9(). */
+static bool
+writes_stencil_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+
+   return has_stencil_att_v9(cmdbuf) && ds->stencil.test_enable &&
+          ((ds->stencil.front.write_mask &&
+            (ds->stencil.front.op.fail != VK_STENCIL_OP_KEEP ||
+             ds->stencil.front.op.pass != VK_STENCIL_OP_KEEP ||
+             ds->stencil.front.op.depth_fail != VK_STENCIL_OP_KEEP)) ||
+           (ds->stencil.back.write_mask &&
+            (ds->stencil.back.op.fail != VK_STENCIL_OP_KEEP ||
+             ds->stencil.back.op.pass != VK_STENCIL_OP_KEEP ||
+             ds->stencil.back.op.depth_fail != VK_STENCIL_OP_KEEP)));
+}
+
+static bool
+ds_test_always_passes_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+
+   if (!has_depth_att_v9(cmdbuf))
+      return true;
+
+   if (ds->depth.test_enable && ds->depth.compare_op != VK_COMPARE_OP_ALWAYS)
+      return false;
+
+   if (ds->stencil.test_enable &&
+       (ds->stencil.front.op.compare != VK_COMPARE_OP_ALWAYS ||
+        ds->stencil.back.op.compare != VK_COMPARE_OP_ALWAYS))
+      return false;
+
+   return true;
+}
+
+static inline enum mali_func
+translate_compare_func_v9(VkCompareOp comp)
+{
+   return (enum mali_func)comp;
+}
+
+static enum mali_stencil_op
+translate_stencil_op_v9(VkStencilOp in)
+{
+   switch (in) {
+   case VK_STENCIL_OP_KEEP:
+      return MALI_STENCIL_OP_KEEP;
+   case VK_STENCIL_OP_ZERO:
+      return MALI_STENCIL_OP_ZERO;
+   case VK_STENCIL_OP_REPLACE:
+      return MALI_STENCIL_OP_REPLACE;
+   case VK_STENCIL_OP_INCREMENT_AND_CLAMP:
+      return MALI_STENCIL_OP_INCR_SAT;
+   case VK_STENCIL_OP_DECREMENT_AND_CLAMP:
+      return MALI_STENCIL_OP_DECR_SAT;
+   case VK_STENCIL_OP_INCREMENT_AND_WRAP:
+      return MALI_STENCIL_OP_INCR_WRAP;
+   case VK_STENCIL_OP_DECREMENT_AND_WRAP:
+      return MALI_STENCIL_OP_DECR_WRAP;
+   case VK_STENCIL_OP_INVERT:
+      return MALI_STENCIL_OP_INVERT;
+   default:
+      UNREACHABLE("Invalid stencil op");
+   }
+}
+
+static VkResult
+panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
+                      const struct panvk_draw_data *draw,
+                      struct mali_draw_packed *dcd)
+{
+   struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+   /* NULL when no fragment shader is needed (get_fs() / fs_required()). */
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
+   const struct vk_rasterization_state *rs =
+      &cmdbuf->vk.dynamic_graphics_state.rs;
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+   enum mesa_prim reduced_prim = u_reduced_prim(draw->info.prim);
+   const bool non_polygon = reduced_prim != MESA_PRIM_TRIANGLES;
+   /* PATCH v9: blend_ptr/bd_count SEKARANG udah disiapkan lebih awal di
+    * prepare_draw_v9 (sebelum push-uniforms) - tinggal pakai, JANGAN
+    * alokasi+isi ulang di sini (itu penyebab bug clear-only-nya). */
+   uint32_t bd_count = draw->bd_count;
+   struct pan_ptr blend_ptr = draw->blend_ptr;
+   bool test_s = has_stencil_att_v9(cmdbuf) && ds->stencil.test_enable;
+   bool test_z = has_depth_att_v9(cmdbuf) && ds->depth.test_enable;
+   bool writes_z = writes_depth_v9(cmdbuf);
+
+   struct pan_ptr ds_ptr = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
+   if (!ds_ptr.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   float minz, maxz;
+   panvk_depth_range(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state.vp,
+                     &minz, &maxz);
+
+   /* PATCH v9 Draw.depth_stencil: mapping field 1:1 dari referensi
+    * panvk_draw_prepare_fs_rsd() (Bifrost RENDERER_STATE). 3 field
+    * (depth_cull_enable, depth_clamp_mode, depth_source) TIDAK ADA
+    * padanan eksplisit di kode Bifrost yang jadi referensi -- dibiarkan
+    * default genxml (true / [0,1] / Fixed function), BUKAN tebakan. */
+   pan_cast_and_pack(ds_ptr.cpu, DEPTH_STENCIL, cfg) {
+      /* PATCH v9: depth source, stencil-from-shader, depth clip and clamp
+       * were left at the genxml defaults (fixed-function depth, no shader
+       * stencil, clip on, no clamp). With per-sample shading the
+       * shader-written gl_FragDepth was then lost (CTS
+       * depth_stencil_resolve.*, multisample.misc.*.ds_resolve_*), and
+       * depthClamp / depthClipEnable were ignored. Same fields as CSF
+       * prepare_ds(). PANVK_V9_ZSD_OLD=1 restores the old descriptor
+       * (negative control). */
+      static int zsd_old = -1;
+      if (zsd_old < 0)
+         zsd_old = getenv("PANVK_V9_ZSD_OLD") != NULL;
+      if (!zsd_old) {
+         cfg.stencil_from_shader = fs ? fs->info.fs.writes_stencil : 0;
+         cfg.depth_cull_enable = vk_rasterization_state_depth_clip_enable(rs);
+         if (rs->depth_clamp_enable)
+            cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
+         if (fs)
+            cfg.depth_source = pan_depth_source(&fs->info);
+      }
+
+      cfg.stencil_test_enable = test_s;
+      cfg.depth_write_enable = writes_z;
+      cfg.depth_bias_enable = rs->depth_bias.enable;
+      cfg.depth_function =
+         test_z ? translate_compare_func_v9(ds->depth.compare_op)
+                : MALI_FUNC_ALWAYS;
+
+      cfg.depth_units = rs->depth_bias.constant_factor;
+      cfg.depth_factor = rs->depth_bias.slope_factor;
+      cfg.depth_bias_clamp = rs->depth_bias.clamp;
+
+      cfg.front_write_mask = ds->stencil.front.write_mask;
+      cfg.back_write_mask = ds->stencil.back.write_mask;
+      cfg.front_value_mask = ds->stencil.front.compare_mask;
+      cfg.back_value_mask = ds->stencil.back.compare_mask;
+      cfg.front_reference_value = ds->stencil.front.reference;
+      cfg.back_reference_value = ds->stencil.back.reference;
+
+      if (test_s) {
+         cfg.front_compare_function =
+            translate_compare_func_v9(ds->stencil.front.op.compare);
+         cfg.front_stencil_fail =
+            translate_stencil_op_v9(ds->stencil.front.op.fail);
+         cfg.front_depth_fail =
+            translate_stencil_op_v9(ds->stencil.front.op.depth_fail);
+         cfg.front_depth_pass =
+            translate_stencil_op_v9(ds->stencil.front.op.pass);
+         cfg.back_compare_function =
+            translate_compare_func_v9(ds->stencil.back.op.compare);
+         cfg.back_stencil_fail =
+            translate_stencil_op_v9(ds->stencil.back.op.fail);
+         cfg.back_depth_fail =
+            translate_stencil_op_v9(ds->stencil.back.op.depth_fail);
+         cfg.back_depth_pass =
+            translate_stencil_op_v9(ds->stencil.back.op.pass);
+      }
+   }
+
+   pan_pack(dcd, DRAW, cfg) {
+      if (rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM)
+         cfg.flags_0.aligned_line_ends = true;
+
+      cfg.flags_0.multisample_enable =
+         cmdbuf->vk.dynamic_graphics_state.ms.rasterization_samples > 1 &&
+         !(reduced_prim == MESA_PRIM_LINES &&
+           rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM);
+
+      cfg.flags_0.occlusion_query = cmdbuf->state.gfx.occlusion_query.mode;
+      cfg.flags_0.scissor_to_bounding_box = true;
+
+      cfg.flags_0.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+      cfg.flags_0.cull_front_face =
+         !non_polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT) != 0;
+      cfg.flags_0.cull_back_face =
+         !non_polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
+
+      cfg.occlusion = cmdbuf->state.gfx.occlusion_query.ptr;
+
+      /* PATCH v9 Draw.flags_0 early-ZS: these were never set on v9, so the
+       * hardware ran every draw as FORCE_EARLY (enum value 0): depth/stencil
+       * update and occlusion counting happened before the fragment shader,
+       * so samples killed by `discard` were still counted (CTS
+       * occlusion_query.*precise*discard). Same selection as CSF
+       * build_dcd_flags() and gallium jm_emit_draw(). FPK: see below.
+       * PANVK_V9_DCD_NO_EARLYZS=1 restores the old flags
+       * (negative control). */
+      if (fs) {
+         static int no_earlyzs = -1;
+         if (no_earlyzs < 0)
+            no_earlyzs = getenv("PANVK_V9_DCD_NO_EARLYZS") != NULL;
+
+         const struct vk_dynamic_graphics_state *dyns =
+            &cmdbuf->vk.dynamic_graphics_state;
+         bool alpha_to_coverage = dyns->ms.alpha_to_coverage_enable;
+
+         if (!no_earlyzs) {
+            enum pan_earlyzs_zs_tilebuf_read zs_read =
+               (z_attachment_read(fs, &dyns->ial) ||
+                s_attachment_read(fs, &dyns->ial))
+                  ? PAN_EARLYZS_ZS_TILEBUF_READ_NO_OPT
+                  : PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
+            bool oq = cmdbuf->state.gfx.occlusion_query.mode !=
+                      MALI_OCCLUSION_MODE_DISABLED;
+            struct pan_earlyzs_state earlyzs = pan_earlyzs_get(
+               fs->fs.earlyzs_lut,
+               writes_z || writes_stencil_v9(cmdbuf) || oq, alpha_to_coverage,
+               ds_test_always_passes_v9(cmdbuf), zs_read);
+
+            cfg.flags_0.pixel_kill_operation = (enum mali_pixel_kill)earlyzs.kill;
+            cfg.flags_0.zs_update_operation =
+               (enum mali_pixel_kill)earlyzs.update;
+            cfg.flags_0.shader_modifies_coverage =
+               fs->info.fs.writes_coverage || fs->info.fs.can_discard ||
+               alpha_to_coverage;
+         }
+
+         /* Forward pixel kill: a later opaque fragment may kill earlier ones
+          * still in flight at the same pixel. Same rule as CSF
+          * build_dcd_flags() and the v6/v7 RENDERER_STATE path above: only
+          * when the shader can be killed safely (can_fpk), writes every bound
+          * colour target, reads none of them back, nothing reads the
+          * destination (blending), no alpha-to-coverage, no rasterization
+          * order access. PANVK_V9_NO_FPK=1 keeps both bits off (the old,
+          * conservative behaviour; A/B control). */
+         static int no_fpk = -1;
+         if (no_fpk < 0)
+            no_fpk = getenv("PANVK_V9_NO_FPK") != NULL;
+         if (!no_earlyzs && !no_fpk) {
+            uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
+                              MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+            uint8_t rt_written = color_attachment_written_mask(fs, &dyns->cal);
+            uint8_t rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+            bool roa_color =
+               dyns->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+
+            /* A target the shader writes but whose write mask is zero (or
+             * whose colour writes are disabled) keeps its old contents, so
+             * it is not "written": FPK would kill those contents. Partial
+             * masks are already caught by any_dest_read
+             * (pan_blend_reads_dest), a zero mask is not -- the CSF and
+             * v6/v7 rules share that gap; gallium masks with the blend's
+             * enabled_mask. Found by mrt_alias_test (RT1 write mask 0). */
+            for (unsigned i = 0; i < MAX_RTS; i++) {
+               if (!dyns->cb.attachments[i].write_mask ||
+                   !(dyns->cb.color_write_enables & BITFIELD_BIT(i)))
+                  rt_written &= ~BITFIELD_BIT(i);
+            }
+
+            cfg.flags_0.allow_forward_pixel_to_kill =
+               fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
+               !(rt_read & rt_written) && !alpha_to_coverage &&
+               !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
+            cfg.flags_0.allow_forward_pixel_to_be_killed =
+               !fs->info.writes_global;
+         }
+
+         /* PATCH v9: per-sample shading was never requested on v9, so the
+          * FS ran once per pixel even with sampleShadingEnable or a shader
+          * that reads gl_SampleID / gl_SamplePosition / interpolateAtSample
+          * (CTS multisample_shader_builtin.*, multisample_interpolation.*).
+          * Same rule as CSF build_dcd_flags(): also when a blend shader runs
+          * with MSAA (it writes one sample at a time).
+          * PANVK_V9_NO_PER_SAMPLE=1 restores the old behaviour (control). */
+         static int no_per_sample = -1;
+         if (no_per_sample < 0)
+            no_per_sample = getenv("PANVK_V9_NO_PER_SAMPLE") != NULL;
+         if (!no_per_sample)
+            cfg.flags_0.evaluate_per_sample =
+               (fs->info.fs.sample_shading ||
+                cmdbuf->state.gfx.cb.info.needs_shader) &&
+               dyns->ms.rasterization_samples > 1;
+
+         /* PATCH v9: alpha-to-coverage was never enabled in the DCD, so
+          * alpha did not reduce coverage (CTS multisample.alpha_to_coverage.*
+          * alpha_invisible / alpha_translucent). CSF sets the same bit.
+          * Covered by the same control. */
+         if (!no_per_sample)
+            cfg.flags_0.alpha_to_coverage = alpha_to_coverage;
+      } else {
+         /* PATCH v9: no fragment shader (no colour attachment written and no
+          * other FS side effect, e.g. depth-only passes). Same as gallium
+          * jm_emit_draw() and CSF build_dcd_flags(). */
+         cfg.flags_0.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         cfg.flags_0.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         cfg.flags_0.allow_forward_pixel_to_kill = true;
+         cfg.flags_0.allow_forward_pixel_to_be_killed = true;
+         cfg.flags_0.overdraw_alpha0 = true;
+         cfg.flags_0.overdraw_alpha1 = true;
+      }
+
+      /* PATCH v9 Draw.flags_1: TIDAK ADA referensi Bifrost/GL langsung
+       * (field ini spesifik Valhall, nol pemakaian di tree Mesa manapun).
+       * Nilai dipetakan by-analogy dari konsep yang sama yang dipakai
+       * Bifrost RENDERER_STATE (sample_mask dari dynamic state MSAA,
+       * render_target_mask dari bound color attachments) -- BUKAN reuse
+       * kode existing, karena strukturnya beda total. Paling perlu
+       * dicurigai duluan kalau ada hasil aneh di rendering nanti. */
+      cfg.flags_1.sample_mask = cmdbuf->vk.dynamic_graphics_state.ms.sample_mask;
+      cfg.flags_1.render_target_mask =
+         cmdbuf->state.gfx.render.bound_attachments &
+         MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+      PAN_V9_TRACE( "[PANVK_DEBUG_FLAGS1] sample_mask=0x%x render_target_mask=0x%x bound_attachments=0x%x\n",
+              cfg.flags_1.sample_mask, cfg.flags_1.render_target_mask,
+              cmdbuf->state.gfx.render.bound_attachments);
+
+      /* PATCH v9 Draw.vertex_array: genxml comment eksplisit bilang
+       * Pointer/stride "Written by hardware in MallocVertexShader job
+       * mode" -- CPU cuma perlu set packet=true, sisanya diisi hardware
+       * otomatis. Belum ada 1 pun kode Mesa lain yang pernah nyentuh
+       * field ini buat dijadiin referensi silang. */
+      cfg.vertex_array.packet = true;
+
+      cfg.minimum_z = minz;
+      cfg.maximum_z = maxz;
+
+      cfg.depth_stencil = ds_ptr.gpu;
+      {
+         PAN_V9_TRACE( "[PANVK_DEBUG_DS] 32 byte Depth/stencil desc:");
+         uint8_t *dsb = (uint8_t *)ds_ptr.cpu;
+         for (int i = 0; i < 32; i++) PAN_V9_TRACE( " %02x", dsb[i]);
+         PAN_V9_TRACE( "\n");
+         if (bd_count > 0) {
+            PAN_V9_TRACE( "[PANVK_DEBUG_BLENDRAW] %u byte Blend desc(s):", bd_count * 16);
+            uint8_t *bb = (uint8_t *)blend_ptr.cpu;
+            for (uint32_t i = 0; i < bd_count * 16; i++) PAN_V9_TRACE( " %02x", bb[i]);
+            PAN_V9_TRACE( "\n");
+         }
+      }
+
+      cfg.blend_count = bd_count;
+      cfg.blend = blend_ptr.gpu;
+
+      /* PATCH v9: without a fragment shader there is no shader to point at
+       * (get_fs() returned NULL and this dereferenced it: SIGSEGV in CTS
+       * occlusion_query.no_attachments* / *no_color_attachments). Like
+       * gallium jm_emit_draw(): no shader, no blend, no colour target. */
+      if (fs) {
+         cfg.shader.resources = fs_desc_state->res_table;
+         cfg.shader.shader = panvk_priv_mem_dev_addr(fs->spd);
+         cfg.shader.thread_storage = draw->tls;
+         cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
+         cfg.shader.fau_count = fs->fau.total_count;
+      } else {
+         cfg.blend_count = 0;
+         cfg.blend = 0;
+         cfg.flags_1.render_target_mask = 0;
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
+/* PATCH v9 -- BAGIAN 3: job encoder + pemanggil.
+ *
+ * Menyambung BAGIAN 1/1b/2 ke MALLOC_VERTEX_JOB. Sebelum ini semua fungsi di
+ * atas compile tapi nol pemanggil (dead code) dan CmdDraw* cuma stub kosong.
+ *
+ * v9 WAJIB pakai MALLOC_VERTEX_JOB, bukan COMPUTE_JOB+TILER_JOB (Bifrost) dan
+ * bukan INDEXED_VERTEX_JOB. Dasarnya jm_launch_draw() di
+ * src/gallium/drivers/panfrost/pan_jm.c:
+ *
+ *     #if PAN_ARCH == 9
+ *        assert(idvs && "Memory allocated IDVS required on Valhall");
+ *
+ * yaitu satu-satunya jalur Valhall+JM yang ada in-tree. Layout section diambil
+ * dari aggregate "Malloc Vertex Job" di genxml/v9.xml (size 384, 11 section).
+ *
+ * Yang BELUM ditangani di sini, sengaja, supaya unit ini tetap bisa
+ * di-review/di-rollback sendiri:
+ *  - indirect draw (CmdDrawIndirect* masih stub di bawah);
+ *  - multi-layer/multiview: hanya layer 0 yang di-encode;
+ *  - transform feedback dan tessellation.
+ */
+
+/* Same mapping as panfrost_translate_index_size() in
+ * src/gallium/drivers/panfrost/pan_cmdstream.h. Duplicated rather than
+ * included because that header pulls in the whole Gallium driver context. */
+static enum mali_index_type
+translate_index_size(unsigned size)
+{
+   STATIC_ASSERT(MALI_INDEX_TYPE_NONE == 0);
+   STATIC_ASSERT(MALI_INDEX_TYPE_UINT8 == 1);
+   STATIC_ASSERT(MALI_INDEX_TYPE_UINT16 == 2);
+
+   return (size == 4) ? MALI_INDEX_TYPE_UINT32 : size;
+}
+
+/* set_provoking_vertex_mode() lives in the PAN_ARCH < 9 block, so it is not
+ * visible from here. Same logic, kept separate so the Bifrost copy stays
+ * untouched. */
+static void
+set_provoking_vertex_mode_v9(struct panvk_cmd_buffer *cmdbuf,
+                             enum u_tristate first_provoking_vertex)
+{
+   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+
+   if (first_provoking_vertex != U_TRISTATE_UNSET) {
+      assert(state->render.first_provoking_vertex == U_TRISTATE_UNSET ||
+             state->render.first_provoking_vertex == first_provoking_vertex);
+      state->render.first_provoking_vertex = first_provoking_vertex;
+   }
+
+   /* Once the first FBDs/TDs are emitted we have to commit to a mode.
+    * PROVOKING_VERTEX_MODE_FIRST is the Vulkan default, so it is right more
+    * often. Same TODO as the Bifrost path: this deserves better handling. */
+   if (state->render.first_provoking_vertex == U_TRISTATE_UNSET)
+      state->render.first_provoking_vertex = U_TRISTATE_YES;
+}
+
+static VkResult
+panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
+                                     struct panvk_draw_data *draw)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
+   const struct vk_input_assembly_state *ia =
+      &cmdbuf->vk.dynamic_graphics_state.ia;
+   const struct vk_rasterization_state *rs =
+      &cmdbuf->vk.dynamic_graphics_state.rs;
+   enum mesa_prim reduced_prim = u_reduced_prim(draw->info.prim);
+
+   /* The varying ("secondary") shader only feeds the fragment shader, so it is
+    * pointless without one. Mirrors jm_emit_malloc_vertex_job(). */
+   const bool secondary_shader =
+      fs != NULL && panvk_priv_mem_check_alloc(vs->spds.var);
+
+   struct pan_ptr ptr = panvk_cmd_alloc_desc(cmdbuf, MALLOC_VERTEX_JOB);
+   if (!ptr.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   /* The descriptor pool hands back recycled memory, and not every byte of
+    * the job is written below. Measured in CTS (asm_triangle then transfer
+    * in one process): bytes +64..+111 and +320..+383 of this job still held
+    * the previous user's clear colour (0xffbf4020), and the job ended with
+    * DATA_INVALID_FAULT (0x58). Run alone, the same test got zeroed memory
+    * and passed. Which descriptor fields those bytes belong to was not
+    * established. Zero the whole job first. PANVK_MVJ_NO_ZERO=1 is the
+    * control. */
+   if (!getenv("PANVK_MVJ_NO_ZERO"))
+      memset(ptr.cpu, 0, pan_size(MALLOC_VERTEX_JOB));
+
+   util_dynarray_append(&batch->jobs, ptr.cpu);
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
+      cfg.draw_mode = translate_prim(draw->info.prim);
+      cfg.index_count = draw->info.vertex.count;
+
+      /* EXPERIMENT: base_vertex_offset was hardcoded to 0 for non-indexed
+       * draws, which made vkCmdDraw ignore firstVertex entirely. Feeding
+       * vertex.base in both cases is the hypothesis under test. */
+      cfg.base_vertex_offset = draw->info.vertex.base;
+
+      if (draw->info.index.index_size) {
+         cfg.index_type = translate_index_size(draw->info.index.index_size);
+         cfg.base_vertex_offset = draw->info.vertex.base;
+      }
+
+      if (vs->info.vs.writes_point_size &&
+          ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
+         cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
+
+      cfg.primitive_restart = ia->primitive_restart_enable;
+      cfg.secondary_shader = secondary_shader;
+   }
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) {
+      cfg.count = draw->info.instance.count;
+   }
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, ALLOCATION, cfg) {
+      if (secondary_shader) {
+         unsigned sz = vs->info.varyings.formats.generic_size_B;
+         cfg.vertex_packet_stride = sz + 16;
+         cfg.vertex_attribute_stride = sz;
+      } else {
+         /* Hardware requirement for "no varyings" */
+         cfg.vertex_packet_stride = 16;
+         cfg.vertex_attribute_stride = 0;
+      }
+   }
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, TILER, cfg) {
+      cfg.address = draw->tiler_ctx->valhall.desc;
+   }
+
+   /* The scissor is already folded into the viewport descriptor the Bifrost
+    * path emits, but v9 carries it in the job itself. Reuse the same clamping
+    * as panvk_emit_viewport() so both paths agree. */
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, SCISSOR, cfg) {
+      const struct vk_viewport_state *vp =
+         &cmdbuf->vk.dynamic_graphics_state.vp;
+
+      if (vp->scissor_count > 0) {
+         const VkRect2D *s = &vp->scissors[0];
+         uint32_t minx = s->offset.x;
+         uint32_t miny = s->offset.y;
+         uint32_t maxx = s->offset.x + s->extent.width;
+         uint32_t maxy = s->offset.y + s->extent.height;
+
+         /* Maximum is inclusive. */
+         maxx = maxx > minx ? maxx - 1 : maxx;
+         maxy = maxy > miny ? maxy - 1 : maxy;
+
+         cfg.scissor_minimum_x = MIN2(minx, UINT16_MAX);
+         cfg.scissor_minimum_y = MIN2(miny, UINT16_MAX);
+         cfg.scissor_maximum_x = MIN2(maxx, UINT16_MAX);
+         cfg.scissor_maximum_y = MIN2(maxy, UINT16_MAX);
+      } else {
+         cfg.scissor_maximum_x = MAX_FRAMEBUFFER_DIMENSION - 1;
+         cfg.scissor_maximum_y = MAX_FRAMEBUFFER_DIMENSION - 1;
+      }
+   }
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {
+      if (vs->info.vs.writes_point_size &&
+          ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
+         cfg.size_array = draw->psiz;
+      else if (reduced_prim == MESA_PRIM_LINES)
+         cfg.fixed_sized = rs->line.width;
+      else
+         cfg.fixed_sized = 1.0f;
+   }
+
+   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, INDICES, cfg) {
+      /* The hardware starts fetching at this address, so firstIndex has to be
+       * folded in here. Passing the buffer base alone made vkCmdDrawIndexed
+       * ignore firstIndex entirely. info.index.offset is in index units, not
+       * bytes, so it is scaled by the index size. */
+      cfg.address = draw->info.index.buffer_dev_addr +
+                    (uint64_t)draw->info.index.offset *
+                       draw->info.index.index_size;
+   }
+
+   VkResult result = panvk_emit_fs_draw_v9(
+      cmdbuf, draw, pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, DRAW));
+   if (result != VK_SUCCESS)
+      return result;
+
+   panvk_emit_vs_position_v9(
+      cmdbuf, draw, pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, POSITION));
+
+   /* VARYING is left zeroed when there is no secondary shader. Gallium does
+    * the same (`if (!secondary_shader) continue;`) and points the varying
+    * environment at the same state as the position one otherwise. */
+   if (secondary_shader) {
+      pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, VARYING, cfg) {
+         const struct panvk_shader_desc_state *vs_desc_state =
+            &cmdbuf->state.gfx.vs.desc;
+
+         cfg.resources = vs_desc_state->res_table;
+         cfg.shader = panvk_priv_mem_dev_addr(vs->spds.var);
+         cfg.thread_storage = draw->tls;
+         cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
+         /* The FAU count was missing here while the POSITION environment sets
+          * it, so the varying shader ran with a valid FAU pointer and a count
+          * of zero. Gallium sets the count for both environments (pan_jm.c,
+          * jm_emit_shader_env). Measured effect without it: every vertex
+          * shader whose FAU block was 4 words or more produced a fully black
+          * image, while the 3-word single-varying shaders used earlier in
+          * Phase 4 were unaffected. Exactly which FAU word the varying shader
+          * needs was not established. The varying shader shares the position
+          * shader's push-uniform block, so the count is the same.
+          * PANVK_VARYING_NO_FAU_COUNT reproduces the old behaviour. */
+         if (!getenv("PANVK_VARYING_NO_FAU_COUNT"))
+            cfg.fau_count = vs->fau.total_count;
+      }
+   }
+
+   draw->jobs.idvs = ptr;
+   return VK_SUCCESS;
+}
+
+/* PATCH DEBUG v9 (sementara) -- dump mentah Malloc Vertex Job, biar dicocokin
+ * manual ke layout genxml. HAPUS setelah bug ketemu.
+ *
+ * WAJIB dipanggil SESUDAH pan_jc_add_job(): bytes +000..+031 itu Job Header,
+ * dan yang menulisnya adalah pan_jc_add_job(), bukan
+ * panvk_draw_prepare_malloc_vertex_job(). Dump sebelum itu selalu memberi
+ * header nol -- yang berarti Type=0 (Not started), bukan 11 (Malloc vertex) --
+ * dan itu artefak waktu pengambilan dump, bukan bug.
+ *
+ * Field yang paling penting dicek di sini (v9.xml "Job Header"):
+ *   Type            word 4, bit 1..7    -> harus 11 (Malloc vertex)
+ *   Index           word 4, bit 16..31  -> nomor job, bukan 0
+ *   Dependency 1/2  word 5
+ *   Next            word 6..7           -> 0 kalau job terakhir di chain
+ */
+static void
+panvk_debug_dump_malloc_vertex_job(const struct pan_ptr *job, const char *label)
+{
+   if (!pan_v9_trace_enabled())
+      return;
+
+   const uint8_t *bytes = (const uint8_t *)job->cpu;
+   FILE *out = stderr;
+   uint32_t word4, word5;
+
+   memcpy(&word4, bytes + 16, sizeof(word4));
+   memcpy(&word5, bytes + 20, sizeof(word5));
+
+   uint32_t type = (word4 >> 1) & BITFIELD_MASK(7);
+   uint32_t index = word4 >> 16;
+
+   fprintf(out,
+           "[PANVK_DEBUG_MVJ] %s gpu=0x%" PRIx64
+           " header: type=%u (%s) index=%u dep1=%u dep2=%u\n",
+           label, job->gpu, type,
+           type == MALI_JOB_TYPE_MALLOC_VERTEX ? "MALLOC_VERTEX == BENAR"
+                                               : "BUKAN MALLOC_VERTEX",
+           index, word5 & BITFIELD_MASK(16), word5 >> 16);
+
+   fprintf(out, "[PANVK_DEBUG_MVJ] dump 384 byte job descriptor:\n");
+   for (int row = 0; row < 384; row += 16) {
+      fprintf(out, "[PANVK_DEBUG_MVJ] +%03d:", row);
+      for (int col = 0; col < 16; col++)
+         fprintf(out, " %02x", bytes[row + col]);
+      fprintf(out, "\n");
+   }
+}
+
+static VkResult
+prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
+   const struct vk_rasterization_state *rs =
+      &cmdbuf->vk.dynamic_graphics_state.rs;
+   VkResult result;
+
+   /* Same job-index guard as the Bifrost path, minus the copy-descriptor
+    * pilot job: v9 has none, and one draw is a single MALLOC_VERTEX job.
+    * PANVK_V9_SPLIT_AT=<n> lowers the limit (test knob: forces batch splits
+    * inside a render pass, so the spill/reload path can be checked with
+    * small tests). */
+   static int split_at = -1;
+   if (split_at < 0)
+      split_at = getenv("PANVK_V9_SPLIT_AT") ? atoi(getenv("PANVK_V9_SPLIT_AT")) : UINT16_MAX;
+   if (batch->vtc_jc.job_index + cmdbuf->state.gfx.render.layer_count >=
+       (unsigned)split_at) {
+      panvk_per_arch(cmd_close_batch)(cmdbuf);
+      batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+   }
+
+   if (cmdbuf->state.gfx.vk_meta) {
+      /* vk_meta doesn't care about the provoking vertex mode, we should use
+       * the same mode that the application uses. */
+      set_provoking_vertex_mode_v9(cmdbuf, U_TRISTATE_UNSET);
+   } else {
+      set_provoking_vertex_mode_v9(
+         cmdbuf, u_tristate_make(rs->provoking_vertex ==
+                                 VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT));
+   }
+
+   if (!rs->rasterizer_discard_enable) {
+      uint32_t *nr_samples = &cmdbuf->state.gfx.render.fb.nr_samples;
+      uint32_t rasterization_samples =
+         cmdbuf->vk.dynamic_graphics_state.ms.rasterization_samples;
+
+      if (!batch->fb.desc.gpu && !cmdbuf->state.gfx.render.bound_attachments) {
+         assert(rasterization_samples > 0);
+         *nr_samples = rasterization_samples;
+      } else {
+         assert(rasterization_samples == *nr_samples);
+      }
+
+      result = panvk_per_arch(cmd_alloc_fb_desc)(cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   panvk_per_arch(cmd_select_tile_size)(cmdbuf);
+
+   result = panvk_per_arch(cmd_alloc_tls_desc)(cmdbuf, true);
+   if (result != VK_SUCCESS)
+      return result;
+
+   draw->tls = batch->tls.gpu;
+   draw->fb = batch->fb.desc.gpu;
+
+   const struct panvk_shader_desc_info *vs_desc_info =
+      &cmdbuf->state.gfx.vs.shader->desc_info;
+   const struct panvk_shader_desc_info *fs_desc_info =
+      fs ? &cmdbuf->state.gfx.fs.shader->desc_info : NULL;
+   uint32_t used_set_mask =
+      vs_desc_info->used_set_mask | (fs ? fs_desc_info->used_set_mask : 0);
+
+   result = panvk_per_arch(cmd_prepare_push_descs)(
+      cmdbuf, &cmdbuf->state.gfx.desc_state, used_set_mask);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Driver sets + resource tables for both stages. */
+   /* emit_vs_attrib() folds vi.base_instance * stride into every
+    * instance-rate attribute offset, but nothing on the v9 path ever assigned
+    * vi.base_instance, so firstInstance was ignored for instance-rate vertex
+    * attributes even on direct draws. The CSF path sets it per draw
+    * (csf/panvk_vX_cmd_draw.c). For indirect draws this is the placeholder 0
+    * and the helper kernel adds the real firstInstance on the GPU. The VS
+    * driver set is rebuilt on every v9 draw, so no dirty tracking is needed. */
+   cmdbuf->state.gfx.vi.base_instance = draw->info.instance.base;
+
+   result = prepare_gfx_desc(cmdbuf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* PATCH v9: siapin blend descriptor SEBELUM sysvals/push-uniforms,
+    * biar cmdbuf->state.gfx.fs.blend_descs[] yang dibaca set_gfx_sysval()
+    * di bawah ini udah final buat draw ini, bukan nilai draw sebelumnya. */
+   if (fs) {
+      draw->bd_count = cmdbuf->state.gfx.render.fb.layout.rt_count;
+      if (draw->bd_count > 0) {
+         draw->blend_ptr =
+            panvk_cmd_alloc_desc_array(cmdbuf, draw->bd_count, BLEND);
+         if (!draw->blend_ptr.gpu)
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+         result =
+            panvk_per_arch(blend_emit_descs)(cmdbuf, draw->blend_ptr.cpu);
+         if (result != VK_SUCCESS)
+            return result;
+
+         PAN_V9_TRACE( "[PANVK_DEBUG_BLENDFIX] blend_ptr.gpu=0x%lx bd_count=%u state.blend_descs[0]=0x%lx\n",
+                 (unsigned long)draw->blend_ptr.gpu, draw->bd_count,
+                 (unsigned long)cmdbuf->state.gfx.fs.blend_descs[0]);
+      }
+   }
+
+   batch->tlsinfo.tls.size = MAX3(vs->info.tls_size, fs ? fs->info.tls_size : 0,
+                                  batch->tlsinfo.tls.size);
+
+   panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, &draw->info, fs);
+
+   struct pan_ptr vs_push_uniforms;
+   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, vs,
+                                                          &vs_push_uniforms, 1);
+   if (result != VK_SUCCESS)
+      return result;
+   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+
+   PAN_V9_TRACE( "[PANVK_DEBUG_VSFAU] gpu=0x%llx count=%u bytes=%u:",
+           (unsigned long long)vs_push_uniforms.gpu,
+           vs->fau.total_count, vs->fau.total_count * 8);
+   for (uint32_t i = 0; i < vs->fau.total_count * 8; i++)
+      PAN_V9_TRACE( " %02x", ((uint8_t *)vs_push_uniforms.cpu)[i]);
+   PAN_V9_TRACE( "\n");
+
+   if (fs) {
+      struct pan_ptr fs_push_uniforms;
+      result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+         cmdbuf, fs, &fs_push_uniforms, 1);
+      if (result != VK_SUCCESS)
+         return result;
+      cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
+
+      PAN_V9_TRACE( "[PANVK_DEBUG_FSFAU] gpu=0x%llx count=%u bytes=%u:",
+              (unsigned long long)fs_push_uniforms.gpu,
+              fs->fau.total_count, fs->fau.total_count * 8);
+      for (uint32_t i = 0; i < fs->fau.total_count * 8; i++)
+         PAN_V9_TRACE( " %02x", ((uint8_t *)fs_push_uniforms.cpu)[i]);
+      PAN_V9_TRACE( "\n");
+   }
+
+   /* One tiler context per layer; panvk_cmd_draw_v9() calls this once per
+    * layer (or view) with draw->info.layer_id set. */
+   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf,
+                                                      draw->info.layer_id);
+   if (result != VK_SUCCESS)
+      return result;
+
+   draw->tiler_ctx = &batch->tiler.ctx;
+
+   return panvk_draw_prepare_malloc_vertex_job(cmdbuf, draw);
+}
+
+static void panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
+                                    struct panvk_draw_data *draw);
+
+/* Layered rendering and multiview on v9 JM, same scheme as the Bifrost path
+ * (prepare_draw_layer): every draw is recorded once per framebuffer layer (or
+ * per view in the view mask) with its own tiler context and layer_id sysval.
+ * The fragment jobs are already emitted per layer when the batch is closed.
+ * Before this only layer 0 was drawn, so for example a single
+ * vkCmdCopyBufferToImage region with layerCount 6 into an AFBC cube (copied
+ * through the graphics path) left layers 1..5 unwritten.
+ * PANVK_V9_LAYER0_ONLY=1 restores the old behaviour as a negative control. */
+static void
+panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
+                  struct panvk_draw_data *draw)
+{
+   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+   uint32_t layer_count = view_mask ? util_bitcount(view_mask)
+                                    : cmdbuf->state.gfx.render.layer_count;
+
+   if (layer_count <= 1 || getenv("PANVK_V9_LAYER0_ONLY")) {
+      draw->info.layer_id = view_mask ? u_bit_scan(&view_mask) : 0;
+      panvk_cmd_draw_v9_layer(cmdbuf, draw);
+      return;
+   }
+
+   for (uint32_t i = 0; i < layer_count; i++) {
+      draw->info.layer_id = view_mask ? u_bit_scan(&view_mask) : i;
+      panvk_cmd_draw_v9_layer(cmdbuf, draw);
+   }
+}
+
+static void
+panvk_cmd_draw_v9_layer(struct panvk_cmd_buffer *cmdbuf,
+                        struct panvk_draw_data *draw)
+{
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   /* If there's no vertex shader, we can skip the draw. On v9 the vertex
+    * program is an SPD, not an RSD. */
+   /* PATCH v9: sepasang dengan fix di panvk_emit_vs_position_v9 --
+    * cek alokasi harus ikut topology juga, bukan selalu pos_triangles,
+    * kalau tidak draw titik (MESA_PRIM_POINTS) selalu di-skip diam-diam
+    * walau shadernya valid (dialokasikan di slot pos_points, bukan
+    * pos_triangles). */
+   const bool pos_spd_alloc = draw->info.prim == MESA_PRIM_POINTS
+                                 ? panvk_priv_mem_check_alloc(vs->spds.pos_points)
+                                 : panvk_priv_mem_check_alloc(vs->spds.pos_triangles);
+   if (!pos_spd_alloc)
+      return;
+
+   assert(batch);
+
+   /* Needs to be done before get_fs() is called because it depends on
+    * fs.required being initialized. */
+   cmdbuf->state.gfx.fs.required =
+      fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+
+   if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
+      return;
+
+   /* PATCH v9: prepare_draw_v9() closes the batch and opens a new one when
+    * the 16-bit job index would overflow. The pointer read at the top of this
+    * function is then the closed batch, and the job was chained into its
+    * vertex/tiler chain while using the new batch's tiler context: every
+    * draw after the split got lost (CTS
+    * api.command_buffers.record_many_draws_secondary_2, 65k+ jobs in one
+    * render pass). The Bifrost path reads cur_batch after prepare_draw() for
+    * the same reason. PANVK_V9_STALE_BATCH=1 restores the old behaviour
+    * (negative control). */
+   static int stale_batch = -1;
+   if (stale_batch < 0)
+      stale_batch = getenv("PANVK_V9_STALE_BATCH") != NULL;
+   if (!stale_batch)
+      batch = cmdbuf->cur_batch;
+
+   /* Indirect draws: the counts are not known at record time, so the job is
+    * built with placeholders, parked as NOT_STARTED so the hardware cannot run
+    * it yet, and a helper kernel then overwrites the count fields from the
+    * application's buffer and promotes the job header to MALLOC_VERTEX. Same
+    * shape as the indirect compute dispatch path in panvk_vX_cmd_dispatch.c.
+    *
+    * The helper is queued first so its job index can be used as the dependency
+    * for the draw. */
+   const bool is_indirect = draw->info.indirect.buffer_dev_addr != 0;
+   unsigned indirect_dep = 0;
+
+   /* Addresses of the draw-parameter sysvals inside this draw's freshly
+    * allocated VS push uniform block, or 0 when the shader does not read them.
+    * The indirect helper fills them from the application's buffer, since the
+    * CPU only had placeholders. Same scheme as the Bifrost path above. */
+   uint64_t fv_sysval = 0, bi_sysval = 0;
+   if (is_indirect) {
+      /* Must be the variant prepare_draw_v9 built the push uniforms from,
+       * otherwise the remapped offsets point at the wrong slots. */
+      const struct panvk_shader_variant *ivs =
+         panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      if (shader_uses_sysval(ivs, graphics, vs.first_vertex))
+         fv_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                     shader_remapped_sysval_offset(
+                        ivs, sysval_offset(graphics, vs.first_vertex));
+      if (shader_uses_sysval(ivs, graphics, vs.base_instance))
+         bi_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                     shader_remapped_sysval_offset(
+                        ivs, sysval_offset(graphics, vs.base_instance));
+
+      /* Negative control: withhold the pointers, reproducing the behaviour
+       * before the sysvals were patched. */
+      if (getenv("PANVK_INDIRECT_NO_SYSVAL"))
+         fv_sysval = bi_sysval = 0;
+   }
+
+   /* Instance-rate attributes whose descriptor Offset the helper must bump by
+    * firstInstance * binding stride. Descriptors 0..MAX_VS_ATTRIBS-1 of the VS
+    * driver set are the attributes (prepare_vs_driver_set). */
+   uint64_t vs_attribs = 0, inst_strides = 0;
+   uint32_t inst_mask = 0;
+   if (is_indirect && !getenv("PANVK_INDIRECT_NO_INSTATTR")) {
+      const struct vk_dynamic_graphics_state *idyns =
+         &cmdbuf->vk.dynamic_graphics_state;
+      const struct vk_vertex_input_state *ivi = idyns->vi;
+      uint32_t strides[MAX_VS_ATTRIBS] = {0};
+      u_foreach_bit(a, ivi->attributes_valid) {
+         const uint32_t b = ivi->attributes[a].binding;
+         if (ivi->bindings[b].input_rate != VK_VERTEX_INPUT_RATE_INSTANCE)
+            continue;
+         inst_mask |= BITFIELD_BIT(a);
+         strides[a] = idyns->vi_binding_strides[b];
+      }
+      if (inst_mask) {
+         struct pan_ptr sp =
+            panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(strides), 4);
+         if (!sp.gpu)
+            return;
+         memcpy(sp.cpu, strides, sizeof(strides));
+         inst_strides = sp.gpu;
+         vs_attribs = cmdbuf->state.gfx.vs.desc.driver_set.dev_addr;
+      }
+   }
+
+   /* T4.5.8 experiment. Removing the dependency entirely (PANVK_INDIRECT_NODEP)
+    * changed nothing observable in 40 runs, which means the ordering could have
+    * been coming from chain-order serialisation rather than from the dependency.
+    * Those two hypotheses are separated by reversing the chain while KEEPING the
+    * dependency: queue the draw first, so it sits earlier in the next-pointer
+    * chain, and point its dependency at the helper that has not been added yet.
+    *
+    * pan_jc_add_job assigns index = ++jc->job_index, so with the draw added
+    * first the helper is deterministically two past the current value. This is a
+    * forward dependency, which is the point: if the hardware honours it the
+    * output stays correct and the dependency is doing real work, and if it does
+    * not the draw reads the CPU placeholder and the output collapses to the
+    * degenerate case.
+    */
+   const bool chain_reverse = is_indirect && getenv("PANVK_INDIRECT_CHAIN_REVERSE");
+
+   if (chain_reverse) {
+      const unsigned predicted_helper_index = batch->vtc_jc.job_index + 2;
+
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_NOT_STARTED, false, false, 0,
+                     predicted_helper_index, &draw->jobs.idvs, false);
+
+      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+      if (draw->info.index.index_size) {
+         panlib_draw_indexed_indirect_helper(
+            &precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+            draw->info.indirect.buffer_dev_addr, draw->jobs.idvs.gpu,
+            draw->info.index.buffer_dev_addr, draw->info.index.index_size,
+            fv_sysval, bi_sysval, vs_attribs, inst_mask, inst_strides,
+            draw->info.indirect.count_buffer_dev_addr, draw->info.draw_id);
+      } else {
+         panlib_draw_indirect_helper(&precomp_ctx, panlib_1d(1),
+                                     PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+                                     draw->info.indirect.buffer_dev_addr,
+                                     draw->jobs.idvs.gpu, fv_sysval, bi_sysval,
+                                     vs_attribs, inst_mask, inst_strides,
+                                     draw->info.indirect.count_buffer_dev_addr,
+                                     draw->info.draw_id);
+      }
+
+      /* Confirm the prediction rather than trusting it. If the helper did not
+       * land on the predicted index the experiment is measuring the wrong thing
+       * and the log has to say so. */
+      if (batch->vtc_jc.job_index != predicted_helper_index) {
+         PAN_V9_TRACE(
+                 "[PANVK_DEBUG_CHAINREV] prediction MISSED: expected helper "
+                 "index %u, got %u\n",
+                 predicted_helper_index, batch->vtc_jc.job_index);
+      } else {
+         PAN_V9_TRACE(
+                 "[PANVK_DEBUG_CHAINREV] draw queued first, forward dep on "
+                 "helper index %u (confirmed)\n",
+                 predicted_helper_index);
+      }
+      goto indirect_chain_done;
+   }
+
+   if (is_indirect) {
+      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+
+      if (draw->info.index.index_size) {
+         panlib_draw_indexed_indirect_helper(
+            &precomp_ctx, panlib_1d(1), PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+            draw->info.indirect.buffer_dev_addr, draw->jobs.idvs.gpu,
+            draw->info.index.buffer_dev_addr, draw->info.index.index_size,
+            fv_sysval, bi_sysval, vs_attribs, inst_mask, inst_strides,
+            draw->info.indirect.count_buffer_dev_addr, draw->info.draw_id);
+      } else {
+         panlib_draw_indirect_helper(&precomp_ctx, panlib_1d(1),
+                                     PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
+                                     draw->info.indirect.buffer_dev_addr,
+                                     draw->jobs.idvs.gpu, fv_sysval, bi_sysval,
+                                     vs_attribs, inst_mask, inst_strides,
+                                     draw->info.indirect.count_buffer_dev_addr,
+                                     draw->info.draw_id);
+      }
+
+      indirect_dep = batch->vtc_jc.job_index;
+
+      /* Negative control, T4.4.9. Dropping the dependency leaves the helper and
+       * the draw job unordered. If the correct output still appears, then the
+       * ordering was never coming from this dependency and every indirect
+       * result would be a race that happens to resolve favourably. Env-gated so
+       * the shipped path is untouched. */
+      if (getenv("PANVK_INDIRECT_NODEP"))
+         indirect_dep = 0;
+   }
+
+   pan_jc_add_job(&batch->vtc_jc,
+                  is_indirect ? MALI_JOB_TYPE_NOT_STARTED
+                              : MALI_JOB_TYPE_MALLOC_VERTEX,
+                  false, false, 0, indirect_dep, &draw->jobs.idvs, false);
+
+indirect_chain_done:
+
+   /* PATCH DEBUG v9 (sementara): sesudah pan_jc_add_job, jadi Job Header
+    * sudah terisi. Lihat komentar di panvk_debug_dump_malloc_vertex_job(). */
+   panvk_debug_dump_malloc_vertex_job(&draw->jobs.idvs, "sesudah pan_jc_add_job");
+
+   PAN_V9_TRACE(
+           "[PANVK_DEBUG_MVJ] jc state: first_job=0x%" PRIx64
+           " job_index=%u tiler_dep=%u\n",
+           batch->vtc_jc.first_job, batch->vtc_jc.job_index,
+           batch->vtc_jc.tiler_dep);
+
+   clear_dirty_after_draw(cmdbuf);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+                        uint32_t instanceCount, uint32_t firstVertex,
+                        uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   if (instanceCount == 0 || vertexCount == 0)
+      return;
+
+   /* gl_BaseVertexARB is a signed integer, and it should expose the value of
+    * firstVertex in a non-indexed draw. */
+   assert(firstVertex < INT32_MAX);
+
+   /* gl_BaseInstance is a signed integer, and it should expose the value of
+    * firstInstance. */
+   assert(firstInstance < INT32_MAX);
+
+   struct panvk_draw_data draw = {
+      .info = {
+         .vertex.base = firstVertex,
+         .vertex.count = vertexCount,
+         .instance.base = firstInstance,
+         .instance.count = instanceCount,
+         .prim = panvk_get_client_prim(cmdbuf),
+      },
+      .vertex_range = vertexCount,
+   };
+
+   panvk_cmd_draw_v9(cmdbuf, &draw);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+                               uint32_t indexCount, uint32_t instanceCount,
+                               uint32_t firstIndex, int32_t vertexOffset,
+                               uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   if (instanceCount == 0 || indexCount == 0)
+      return;
+
+   assert(firstInstance < INT32_MAX);
+
+   struct panvk_draw_data draw = {
+      .info = {
+         .index = panvk_draw_info_index(cmdbuf, firstIndex),
+         .vertex.base = vertexOffset,
+         .vertex.count = indexCount,
+         .instance.base = firstInstance,
+         .instance.count = instanceCount,
+         .prim = panvk_get_client_prim(cmdbuf),
+      },
+      .vertex_range = indexCount,
+   };
+
+   panvk_cmd_draw_v9(cmdbuf, &draw);
+}
+
+/* Job Manager hardware has no indirect-draw descriptor, so each draw becomes a
+ * job plus a helper kernel that patches its counts. There is no multi-draw
+ * descriptor either, so drawCount (or maxDrawCount) is unrolled into that many
+ * pairs, each with its own gl_DrawID. For the *Count variants the helper turns
+ * the draws at or past the GPU-side count into NULL jobs.
+ *
+ * The counts in the draw info are placeholders. The helper overwrites
+ * index_count, base_vertex_offset and the instance count in the descriptor
+ * before the job is allowed to run.
+ *
+ * The indexed variant does NOT run the Bifrost min/max index search: on v9
+ * varyings are hardware-allocated, so nothing is sized from the vertex range. */
+static void
+draw_indirect_unrolled_v9(struct panvk_cmd_buffer *cmdbuf,
+                          struct panvk_buffer *buffer, VkDeviceSize offset,
+                          uint32_t draw_count, uint32_t stride, bool indexed,
+                          uint64_t count_buffer_dev_addr)
+{
+   /* Negative controls: PANVK_MDI_NO_DRAWID gives every draw gl_DrawID 0,
+    * PANVK_MDI_NO_COUNT ignores the count buffer (all maxDrawCount draws
+    * run). */
+   const bool no_draw_id = getenv("PANVK_MDI_NO_DRAWID") != NULL;
+   if (getenv("PANVK_MDI_NO_COUNT"))
+      count_buffer_dev_addr = 0;
+
+   for (uint32_t i = 0; i < draw_count; i++) {
+      struct panvk_draw_data draw = {
+         .info = {
+            .vertex.base = 0,
+            .vertex.count = 1,
+            .instance.base = 0,
+            .instance.count = 1,
+            .prim = panvk_get_client_prim(cmdbuf),
+            .indirect.buffer_dev_addr =
+               panvk_buffer_gpu_ptr(buffer, offset + (uint64_t)i * stride),
+            .indirect.count_buffer_dev_addr = count_buffer_dev_addr,
+            .indirect.draw_count = 1,
+            .indirect.stride = 0,
+            .draw_id = no_draw_id ? 0 : i,
+         },
+         .vertex_range = 1,
+      };
+      if (indexed)
+         draw.info.index =
+            (__typeof__(draw.info.index))panvk_draw_info_index(cmdbuf, 0);
+
+      panvk_cmd_draw_v9(cmdbuf, &draw);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+                                VkDeviceSize offset, uint32_t drawCount,
+                                uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   if (drawCount == 0)
+      return;
+
+   draw_indirect_unrolled_v9(cmdbuf, buffer, offset, drawCount, stride, false,
+                             0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+                                       VkBuffer _buffer, VkDeviceSize offset,
+                                       uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   if (drawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
+      return;
+
+   draw_indirect_unrolled_v9(cmdbuf, buffer, offset, drawCount, stride, true,
+                             0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirectCount)(VkCommandBuffer commandBuffer,
+                                     VkBuffer _buffer, VkDeviceSize offset,
+                                     VkBuffer countBuffer,
+                                     VkDeviceSize countBufferOffset,
+                                     uint32_t maxDrawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+   VK_FROM_HANDLE(panvk_buffer, count_buffer, countBuffer);
+
+   if (maxDrawCount == 0)
+      return;
+
+   draw_indirect_unrolled_v9(cmdbuf, buffer, offset, maxDrawCount, stride,
+                             false,
+                             panvk_buffer_gpu_ptr(count_buffer,
+                                                  countBufferOffset));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer,
+                                            VkBuffer _buffer,
+                                            VkDeviceSize offset,
+                                            VkBuffer countBuffer,
+                                            VkDeviceSize countBufferOffset,
+                                            uint32_t maxDrawCount,
+                                            uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+   VK_FROM_HANDLE(panvk_buffer, count_buffer, countBuffer);
+
+   if (maxDrawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
+      return;
+
+   draw_indirect_unrolled_v9(cmdbuf, buffer, offset, maxDrawCount, stride,
+                             true,
+                             panvk_buffer_gpu_ptr(count_buffer,
+                                                  countBufferOffset));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+                                  const VkRenderingInfo *pRenderingInfo)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+   bool resuming = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT;
+
+   if (resuming && cmdbuf->cur_batch) {
+      state->render.flags = pRenderingInfo->flags;
+   } else {
+      if (cmdbuf->cur_batch)
+         panvk_per_arch(cmd_close_batch)(cmdbuf);
+
+      panvk_per_arch(cmd_init_render_state)(cmdbuf, pRenderingInfo);
+      cmdbuf->state.gfx.render.fb.needs_load = !resuming;
+   }
+
+   if (!cmdbuf->cur_batch)
+      panvk_per_arch(cmd_open_batch)(cmdbuf);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   if (!(cmdbuf->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)) {
+      const struct pan_fb_load *fb_load = &cmdbuf->state.gfx.render.fb.load;
+      bool always_load = fb_load->z.always || fb_load->s.always;
+      for (unsigned rt = 0; rt < PAN_MAX_RTS; rt++) {
+         if (fb_load->rts[rt].always)
+            always_load = true;
+      }
+
+      if (always_load)
+         panvk_per_arch(cmd_alloc_fb_desc)(cmdbuf);
+
+      cmdbuf->state.gfx.render.fb.needs_store = true;
+
+      panvk_per_arch(cmd_close_batch)(cmdbuf);
+      cmdbuf->cur_batch = NULL;
+      panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
+   }
+}
+
+#endif /* PAN_ARCH >= 9 */

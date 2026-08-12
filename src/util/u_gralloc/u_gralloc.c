@@ -17,6 +17,58 @@
 #include "util/u_atomic.h"
 #include "util/u_memory.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static off_t
+u_gralloc_fd_size(int fd)
+{
+   off_t cur = lseek(fd, 0, SEEK_CUR);
+   off_t end = lseek(fd, 0, SEEK_END);
+   if (cur >= 0)
+      lseek(fd, cur, SEEK_SET);
+   return end;
+}
+
+int
+u_gralloc_native_handle_dmabuf_fd(const native_handle_t *handle)
+{
+   if (!handle || handle->numFds <= 0)
+      return -1;
+
+   /* Upstream behaviour: data[0], as long as it is a real buffer.
+    * PANVK_GRALLOC_FD0=1 forces data[0] (negative control). */
+   if (u_gralloc_fd_size(handle->data[0]) > 0 || getenv("PANVK_GRALLOC_FD0"))
+      return handle->data[0];
+
+   int best = -1;
+   off_t best_size = 0;
+   for (int i = 0; i < handle->numFds; i++) {
+      int fd = handle->data[i];
+      off_t size = u_gralloc_fd_size(fd);
+      if (size <= 0)
+         continue;
+
+      char path[64], target[128];
+      snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+      ssize_t n = readlink(path, target, sizeof(target) - 1);
+      if (n > 0) {
+         target[n] = '\0';
+         if (strstr(target, "dmabuf")) {
+            mesa_logd("u_gralloc: dma-buf is native handle fd[%d] (%s)", i,
+                      target);
+            return fd;
+         }
+      }
+      if (size > best_size) {
+         best = fd;
+         best_size = size;
+      }
+   }
+   return best;
+}
 static simple_mtx_t u_gralloc_mutex = SIMPLE_MTX_INITIALIZER;
 
 static const struct u_grallocs {

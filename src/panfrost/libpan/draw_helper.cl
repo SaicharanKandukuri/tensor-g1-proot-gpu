@@ -642,3 +642,242 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
 }
 
 #endif
+
+#if PAN_ARCH == 9
+/* Instance-rate vertex attributes start fetching at firstInstance. The CPU
+ * folds base_instance * stride into each such descriptor's Offset when it knows
+ * firstInstance (emit_vs_attrib, same scheme as the CSF path); for an indirect
+ * draw it only had the placeholder 0, so the helper adds the real value here.
+ * Offset is the plain int32 at word 2 of the Attribute descriptor (v9.xml,
+ * "Offset" start 2:0 size 32). The words are written directly rather than via
+ * pan_pack because word 4 of the same descriptor carries two overlapping field
+ * definitions. Descriptors are PANVK_DESCRIPTOR_SIZE = 32 bytes apart, and the
+ * driver set holding them is allocated per draw, so the add cannot accumulate
+ * across draws. */
+static void
+panlib_v9_patch_instance_attribs(global uint8_t *vs_attribs, uint32_t mask,
+                                 global uint32_t *strides, uint32_t first_instance)
+{
+   if (!vs_attribs || !mask || !first_instance)
+      return;
+   for (uint32_t i = 0; i < 16; i++) {
+      if (!(mask & (1u << i)))
+         continue;
+      global int32_t *offset = (global int32_t *)(vs_attribs + i * 32 + 8);
+      *offset += (int32_t)(first_instance * strides[i]);
+   }
+}
+
+/* v9 indirect draw helper.
+ *
+ * Job Manager hardware has no indirect-draw descriptor on any generation, so
+ * indirect draw is emulated: the CPU builds a complete job, this kernel then
+ * overwrites the count fields from the application's indirect buffer, and the
+ * job header is promoted from a parked state to a real job type.
+ *
+ * The v9 version is far smaller than the Bifrost one above because v9 packs the
+ * whole draw into one MALLOC_VERTEX job instead of separate vertex and tiler
+ * jobs with side-band attribute and varying buffer descriptors.
+ *
+ * Only the fields the CPU path itself derives from the draw call are touched,
+ * so an indirect draw and a direct draw with the same parameters must produce a
+ * byte-identical descriptor. Those fields, per
+ * panvk_draw_prepare_malloc_vertex_job():
+ *
+ *   PRIMITIVE.index_count         <- vertexCount
+ *   PRIMITIVE.base_vertex_offset  <- firstVertex
+ *   INSTANCE_COUNT.count          <- instanceCount
+ *
+ * firstInstance is deliberately NOT written. The CPU path does not write
+ * PRIMITIVE.instance_offset either, so writing it here would make indirect
+ * behave differently from direct rather than the same. That gap belongs to the
+ * direct path and should be fixed there first.
+ *
+ * Everything else in PRIMITIVE - draw mode, index type, restart, the cull and
+ * rotation flags - is read back and re-packed unchanged, so a field the CPU set
+ * is never silently dropped.
+ */
+KERNEL(1)
+panlib_draw_indirect_helper(global VkDrawIndirectCommand *cmd,
+                           global uint8_t *malloc_vertex_job,
+                           global int32_t *first_vertex_sysval,
+                           global int32_t *base_instance_sysval,
+                           global uint8_t *vs_attribs, uint32_t inst_attr_mask,
+                           global uint32_t *inst_attr_strides,
+                           global uint32_t *draw_count_buf, uint32_t draw_index)
+{
+   /* vkCmdDraw*IndirectCount: the CPU unrolls maxDrawCount draws; the ones at
+    * or past the GPU-side count become NULL jobs here. draw_count_buf is NULL
+    * for plain vkCmdDraw*Indirect. */
+   if (draw_count_buf && draw_index >= *draw_count_buf) {
+      struct mali_job_header_packed nop_header;
+      pan_pack(&nop_header, JOB_HEADER, cfg) {
+         cfg.type = MALI_JOB_TYPE_NULL;
+      }
+      pan_merge((global struct mali_job_header_packed *)malloc_vertex_job,
+                &nop_header, JOB_HEADER);
+      return;
+   }
+
+   panlib_v9_patch_instance_attribs(vs_attribs, inst_attr_mask,
+                                    inst_attr_strides, cmd->firstInstance);
+
+   /* Shader-visible draw parameters. gl_BaseVertex and gl_BaseInstance read
+    * these sysvals directly, and gl_InstanceIndex is lowered to
+    * instance_id + base_instance (nir_lower_system_values.c). The direct path
+    * fills them on the CPU from the draw call; for an indirect draw the CPU only
+    * had placeholders, so without this firstInstance had no effect at all on
+    * indirect draws while the direct path honoured it. The push uniform block
+    * these point into is allocated per draw (prepare_push_uniforms), so the
+    * write cannot leak into another draw. A null pointer means the shader does
+    * not use that sysval. */
+   if (first_vertex_sysval)
+      *first_vertex_sysval = (int32_t)cmd->firstVertex;
+   if (base_instance_sysval)
+      *base_instance_sysval = (int32_t)cmd->firstInstance;
+   const uint32_t vertex_count = cmd->vertexCount;
+   const uint32_t instance_count = cmd->instanceCount;
+   const uint32_t first_vertex = cmd->firstVertex;
+
+   /* Either count at zero means there is nothing to draw. Turn the job into a
+    * NULL job rather than submitting a zero-count draw. Same approach as
+    * indirect_dispatch.cl. */
+   const bool is_no_op = (vertex_count == 0) || (instance_count == 0);
+
+   struct mali_job_header_packed job_header;
+   pan_pack(&job_header, JOB_HEADER, cfg) {
+      cfg.type = is_no_op ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_MALLOC_VERTEX;
+   }
+   pan_merge((global struct mali_job_header_packed *)malloc_vertex_job,
+             &job_header, JOB_HEADER);
+
+   if (is_no_op)
+      return;
+
+   global struct mali_primitive_packed *prim =
+      (global struct mali_primitive_packed *)(malloc_vertex_job +
+         pan_section_offset(MALLOC_VERTEX_JOB, PRIMITIVE));
+
+   pan_unpack(prim, PRIMITIVE, unpacked_prim);
+   pan_pack(prim, PRIMITIVE, cfg) {
+      memcpy(&cfg, &unpacked_prim, sizeof(cfg));
+      cfg.index_count = vertex_count;
+      cfg.base_vertex_offset = first_vertex;
+   }
+
+   global struct mali_count_packed *instance_count_sec =
+      (global struct mali_count_packed *)(malloc_vertex_job +
+         pan_section_offset(MALLOC_VERTEX_JOB, INSTANCE_COUNT));
+
+   pan_pack(instance_count_sec, COUNT, cfg) {
+      cfg.count = instance_count;
+   }
+}
+
+/* v9 indexed indirect draw helper.
+ *
+ * Same shape as the non-indexed one, with two additions:
+ *
+ *   PRIMITIVE.base_vertex_offset <- vertexOffset  (signed, added to indices)
+ *   INDICES.address              <- index_buffer_base + firstIndex * index_size
+ *
+ * The hardware starts fetching indices at INDICES.address, so firstIndex has to
+ * be folded into the address rather than passed as a count. The base address and
+ * the index size are supplied by the caller because they are properties of the
+ * bound index buffer, not of the indirect command.
+ *
+ * The Bifrost path additionally runs a min/max index search kernel before the
+ * draw. That exists to size varying and attribute buffers, which need to know
+ * how many distinct vertices the indices actually reference. This v9 path does
+ * not do that, so workloads with varyings or vertex buffers are out of scope -
+ * see the entry point comment.
+ */
+KERNEL(1)
+panlib_draw_indexed_indirect_helper(global VkDrawIndexedIndirectCommand *cmd,
+                                   global uint8_t *malloc_vertex_job,
+                                   uint64_t index_buffer_base,
+                                   uint32_t index_size,
+                                   global int32_t *first_vertex_sysval,
+                                   global int32_t *base_instance_sysval,
+                                   global uint8_t *vs_attribs,
+                                   uint32_t inst_attr_mask,
+                                   global uint32_t *inst_attr_strides,
+                                   global uint32_t *draw_count_buf,
+                                   uint32_t draw_index)
+{
+   /* vkCmdDraw*IndirectCount: the CPU unrolls maxDrawCount draws; the ones at
+    * or past the GPU-side count become NULL jobs here. draw_count_buf is NULL
+    * for plain vkCmdDraw*Indirect. */
+   if (draw_count_buf && draw_index >= *draw_count_buf) {
+      struct mali_job_header_packed nop_header;
+      pan_pack(&nop_header, JOB_HEADER, cfg) {
+         cfg.type = MALI_JOB_TYPE_NULL;
+      }
+      pan_merge((global struct mali_job_header_packed *)malloc_vertex_job,
+                &nop_header, JOB_HEADER);
+      return;
+   }
+
+   panlib_v9_patch_instance_attribs(vs_attribs, inst_attr_mask,
+                                    inst_attr_strides, cmd->firstInstance);
+
+   /* Shader-visible draw parameters. gl_BaseVertex and gl_BaseInstance read
+    * these sysvals directly, and gl_InstanceIndex is lowered to
+    * instance_id + base_instance (nir_lower_system_values.c). The direct path
+    * fills them on the CPU from the draw call; for an indirect draw the CPU only
+    * had placeholders, so without this firstInstance had no effect at all on
+    * indirect draws while the direct path honoured it. The push uniform block
+    * these point into is allocated per draw (prepare_push_uniforms), so the
+    * write cannot leak into another draw. A null pointer means the shader does
+    * not use that sysval. */
+   if (first_vertex_sysval)
+      *first_vertex_sysval = cmd->vertexOffset;
+   if (base_instance_sysval)
+      *base_instance_sysval = (int32_t)cmd->firstInstance;
+   const uint32_t index_count = cmd->indexCount;
+   const uint32_t instance_count = cmd->instanceCount;
+   const uint32_t first_index = cmd->firstIndex;
+   const int32_t vertex_offset = cmd->vertexOffset;
+
+   const bool is_no_op = (index_count == 0) || (instance_count == 0);
+
+   struct mali_job_header_packed job_header;
+   pan_pack(&job_header, JOB_HEADER, cfg) {
+      cfg.type = is_no_op ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_MALLOC_VERTEX;
+   }
+   pan_merge((global struct mali_job_header_packed *)malloc_vertex_job,
+             &job_header, JOB_HEADER);
+
+   if (is_no_op)
+      return;
+
+   global struct mali_primitive_packed *prim =
+      (global struct mali_primitive_packed *)(malloc_vertex_job +
+         pan_section_offset(MALLOC_VERTEX_JOB, PRIMITIVE));
+
+   pan_unpack(prim, PRIMITIVE, unpacked_prim);
+   pan_pack(prim, PRIMITIVE, cfg) {
+      memcpy(&cfg, &unpacked_prim, sizeof(cfg));
+      cfg.index_count = index_count;
+      cfg.base_vertex_offset = vertex_offset;
+   }
+
+   global struct mali_count_packed *instance_count_sec =
+      (global struct mali_count_packed *)(malloc_vertex_job +
+         pan_section_offset(MALLOC_VERTEX_JOB, INSTANCE_COUNT));
+
+   pan_pack(instance_count_sec, COUNT, cfg) {
+      cfg.count = instance_count;
+   }
+
+   global struct mali_indices_packed *indices =
+      (global struct mali_indices_packed *)(malloc_vertex_job +
+         pan_section_offset(MALLOC_VERTEX_JOB, INDICES));
+
+   pan_pack(indices, INDICES, cfg) {
+      cfg.address = index_buffer_base +
+                    (uint64_t)first_index * (uint64_t)index_size;
+   }
+}
+
+#endif

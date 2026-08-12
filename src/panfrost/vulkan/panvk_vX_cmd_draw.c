@@ -11,6 +11,7 @@
 
 #include "pan_desc.h"
 #include "pan_util.h"
+#include "pan_v9_trace.h"
 
 #include "vk_android.h"
 #include "vk_render_pass.h"
@@ -115,6 +116,9 @@ avoid_direct_resolve_to(const struct pan_image *img)
     * framebuffer layout and we could potentially allow direct resolves in
     * more cases.
     */
+   if (PAN_ARCH == 9 && getenv("PANVK_V9_NO_TILE_RESOLVE"))
+      return true;
+
    return PAN_ARCH < 7 && drm_is_afbc(img->props.modifier);
 }
 
@@ -872,6 +876,11 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.raw_vertex_offset,
                   info->vertex.raw_offset);
    set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
+#elif PAN_ARCH == 9
+   /* The v9 JM path issues one MALLOC_VERTEX job per layer (or view) and the
+    * VS drops primitives whose gl_Layer is not this one (lower_layer_writes). */
+   set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, draw_id, info->draw_id);
 #endif
 
    if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {
@@ -952,6 +961,20 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                      (0.5f * viewport->width) + viewport->x);
       set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.y,
                      (0.5f * viewport->height) + viewport->y);
+
+      /* PATCH DEBUG v9 (sementara, buat diagnosis triangle invisible) --
+       * cetak nilai VkViewport mentah dan hasil scale/offset yang
+       * BENERAN kesimpen di cmdbuf->state.gfx.sysvals, bukan tebak dari
+       * dump hex. HAPUS setelah bug ketemu. */
+      PAN_V9_TRACE(
+              "[PANVK_DEBUG_VP] VkViewport: w=%f h=%f x=%f y=%f\n"
+              "[PANVK_DEBUG_VP] computed scale: x=%f y=%f\n"
+              "[PANVK_DEBUG_VP] computed offset: x=%f y=%f\n",
+              viewport->width, viewport->height, viewport->x, viewport->y,
+              cmdbuf->state.gfx.sysvals.viewport.scale.x,
+              cmdbuf->state.gfx.sysvals.viewport.scale.y,
+              cmdbuf->state.gfx.sysvals.viewport.offset.x,
+              cmdbuf->state.gfx.sysvals.viewport.offset.y);
       set_gfx_sysval(cmdbuf, dirty_sysvals, viewport.offset.z,
                      vp->depth_clip_negative_one_to_one ?
                         0.5f * (z_min + z_max) : z_min);

@@ -38,6 +38,7 @@
 #endif
 
 #define MAX_FRAMEBUFFER_LAYERS 256
+#define PANVK_MAX_XFB_BUFFERS 4
 
 struct panvk_cmd_buffer;
 
@@ -94,7 +95,7 @@ struct panvk_rendering_state {
       /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
       uint32_t nr_samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10  /* PATCH: off-by-one -- v9 (JM) masih butuh field-field ini, batas seharusnya <10 */
       uint32_t bo_count;
       struct pan_kmod_bo *bos[(MAX_RTS * PANVK_MAX_PLANES) + 2];
       bool needs_load;
@@ -162,6 +163,17 @@ struct panvk_cmd_graphics_state {
 #endif
    struct panvk_graphics_sysvals sysvals;
 
+   struct {
+      struct {
+         uint64_t address;
+         uint64_t size;
+      } buffers[PANVK_MAX_XFB_BUFFERS];
+      struct pan_ptr offsets;
+      struct panvk_shader_desc_state desc;
+      uint64_t push_uniforms;
+      bool enabled;
+   } xfb;
+
 #if PAN_ARCH < 9
    struct panvk_shader_link link;
 #endif
@@ -202,11 +214,28 @@ struct panvk_cmd_graphics_state {
    } vs;
 
    struct {
+      /* The API vertex shader is executed as compute when tessellation is
+       * active.  gfx.vs.shader remains the hardware raster stage (TES). */
+      const struct panvk_shader *input_vs;
+      const struct panvk_shader *tcs;
+      const struct panvk_shader *tes;
+
+      struct panvk_shader_desc_state vs_desc;
+      struct panvk_shader_desc_state tcs_desc;
+      uint64_t vs_push_uniforms;
+      uint64_t tcs_push_uniforms;
+
+      struct panvk_tess_info info;
+      enum mesa_prim prim;
+      bool active;
+   } tess;
+
+   struct {
       struct panvk_attrib_buf bufs[MAX_VBS];
       unsigned count;
    } vb;
 
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 9  /* PATCH: off-by-one, sama pola seperti tsd -- harusnya >=9 bukan >=10 */
    struct {
       uint32_t base_instance;
       uint32_t attribs_changing_on_base_instance;
@@ -232,7 +261,7 @@ struct panvk_cmd_graphics_state {
    uint64_t vpd;
 #endif
 
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 9  /* PATCH: off-by-one -- v9 (Mali-G57) jatuh di celah, harusnya >= 9 bukan >= 10 */
    uint64_t tsd;
 #endif
 
@@ -446,6 +475,11 @@ struct panvk_draw_info {
    enum mesa_prim prim;
 
 #if PAN_ARCH < 9
+   uint32_t layer_id;
+#elif PAN_ARCH == 9
+   /* Index of this draw within a multi-draw (gl_DrawID). */
+   uint32_t draw_id;
+   /* Layer (or view) this copy of the draw renders, see panvk_cmd_draw_v9. */
    uint32_t layer_id;
 #endif
 };

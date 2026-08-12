@@ -22,6 +22,18 @@ extern "C" {
 
 struct u_gralloc;
 
+/* Return the dma-buf fd of a gralloc native handle.
+ *
+ * Mesa assumes data[0] is the dma-buf. The MediaTek gralloc (seen on
+ * MT6789) puts an "anon_inode:gralloc_extra" fd at data[0], which cannot be
+ * seeked or imported; the dma-buf is data[1], and data[2] is a memfd with
+ * gralloc metadata. data[0] is kept when it is a seekable, non-empty fd, so
+ * other gralloc implementations behave exactly as before. Otherwise the
+ * first fd whose /proc/self/fd link names a dma-buf is used, then the largest
+ * seekable fd. Returns -1 if none is usable.
+ */
+int u_gralloc_native_handle_dmabuf_fd(const native_handle_t *handle);
+
 /* Both Vulkan and EGL API exposes HAL format / pixel stride which is required
  * by the fallback implementation.
  */

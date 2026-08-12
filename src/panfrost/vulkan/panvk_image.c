@@ -32,6 +32,7 @@
 #include "vk_log.h"
 #include "vk_object.h"
 #include "vk_util.h"
+#include "pan_v9_trace.h"
 
 
 static enum mali_texture_dimension
@@ -290,7 +291,16 @@ panvk_image_get_explicit_mod(
    assert(!vk_format_is_depth_or_stencil(image->vk.format));
    assert(image->vk.samples == 1);
    assert(image->vk.image_type != VK_IMAGE_TYPE_3D);
-   assert(panvk_image_can_use_mod(image, iusage, mod, false));
+
+   /* An explicit modifier can come from outside the application: on Android
+    * the platform loader passes the one gralloc chose for a swapchain buffer.
+    * Fail the image creation rather than abort (or, without asserts, build a
+    * layout the hardware cannot use). */
+   if (!panvk_image_can_use_mod(image, iusage, mod, false)) {
+      mesa_loge("explicit modifier 0x%" PRIx64 " unsupported for format %d",
+                mod, image->vk.format);
+      return DRM_FORMAT_MOD_INVALID;
+   }
 
    return mod;
 }
@@ -660,6 +670,8 @@ panvk_image_init(struct panvk_image *image,
    /* Now that we've patched the create/usage flags, we can proceed with the
     * modifier selection. */
    image->vk.drm_format_mod = panvk_image_get_mod(image, pCreateInfo);
+   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID)
+      return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
 
    /* Some modifiers like AFBC affect some decisions we make for vkmeta, but
     * we don't want to outright prevent these modifiers. If those weren't used,
@@ -677,6 +689,8 @@ panvk_image_plane_bind_mem(struct panvk_device *dev,
    plane->plane.base = mem->addr.dev + offset;
    plane->mem = mem;
    plane->mem_offset = offset;
+   PAN_V9_TRACE( "[PANVK_DEBUG_BIND] image plane bind (non-sparse) base=0x%lx (mem->addr.dev=0x%lx offset=%lu)\n",
+           (unsigned long)plane->plane.base, (unsigned long)mem->addr.dev, (unsigned long)offset);
    /* Zero-initialize CRC state. If CRC state is not mapped on the host, do a
     * temporary mapping just for this operation. */
    if (plane->image.props.crc) {
@@ -712,6 +726,7 @@ panvk_image_plane_bind_addr(struct panvk_device *dev,
                             uint64_t addr)
 {
    plane->plane.base = addr;
+   PAN_V9_TRACE( "[PANVK_DEBUG_BIND] image plane bind addr=0x%lx\n", (unsigned long)addr);
 }
 
 static void

@@ -60,6 +60,8 @@ struct panvk_batch {
    struct pan_tls_info tlsinfo;
    unsigned wls_total_size;
    bool issued;
+   /* kbase submission that last ran this batch: a re-issue waits for it. */
+   uint64_t kbase_seqno;
 };
 
 enum panvk_cmd_event_op_type {

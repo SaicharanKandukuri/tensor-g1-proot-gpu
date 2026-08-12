@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <stdlib.h>
 #include "util/mesa-blake3.h"
 #include "vk_alloc.h"
 #include "vk_descriptor_update_template.h"
@@ -85,7 +86,13 @@ write_desc_data(struct panvk_descriptor_set *set, uint32_t binding,
       struct mali_null_descriptor_packed null_desc;                            \
       pan_pack(&null_desc, NULL_DESCRIPTOR, cfg)                               \
          ;                                                                     \
-      write_desc(set, binding, elem, &null_desc, (subdesc));                   \
+      /* A v9 null descriptor is type 0, i.e. all zero bytes.               \
+       * PANVK_NULLDESC_POISON=1 is the negative control: write 0xff bytes  \
+       * (invalid type) instead, so a test that really reads the slot must   \
+       * change. */                                                          \
+      if (getenv("PANVK_NULLDESC_POISON"))                                   \
+         memset(&null_desc, 0xff, sizeof(null_desc));                        \
+      write_desc(set, binding, elem, &null_desc, (subdesc));                 \
    } while (0)
 #else
 #define write_nulldesc(set, binding, elem, subdesc)                            \

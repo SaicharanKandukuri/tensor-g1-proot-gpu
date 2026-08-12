@@ -62,7 +62,7 @@ fallback_gralloc_get_yuv_info(struct u_gralloc *gralloc,
    }
 
    memset(&ycbcr, 0, sizeof(ycbcr));
-   ret = gr_mod->lock_ycbcr(gr_mod, hnd->handle, 0, 0, 0, 0, 0, &ycbcr);
+   ret = gr_mod->lock_ycbcr(gr_mod, (void *)hnd->handle, 0, 0, 0, 0, 0, &ycbcr);
    if (ret) {
       /* HACK: See native_window_buffer_get_buffer_info() and
        * https://issuetracker.google.com/32077885.*/
@@ -72,7 +72,7 @@ fallback_gralloc_get_yuv_info(struct u_gralloc *gralloc,
       mesa_logw("gralloc->lock_ycbcr failed: %d", ret);
       return -EINVAL;
    }
-   gr_mod->unlock(gr_mod, hnd->handle);
+   gr_mod->unlock(gr_mod, (void *)hnd->handle);
 
    ret = bufferinfo_from_ycbcr(&ycbcr, hnd, out);
    if (ret)
@@ -144,7 +144,9 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
    out->drm_fourcc = drm_fourcc;
    out->modifier = DRM_FORMAT_MOD_INVALID;
    out->num_planes = num_planes;
-   out->fds[0] = hnd->handle->data[0];
+   out->fds[0] = u_gralloc_native_handle_dmabuf_fd(hnd->handle);
+   if (out->fds[0] < 0)
+      return -EINVAL;
    out->strides[0] = stride;
 
 #ifdef HAS_FREEDRENO

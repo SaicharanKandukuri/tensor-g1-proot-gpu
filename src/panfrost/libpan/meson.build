@@ -7,6 +7,7 @@ libpan_shader_files = files(
   'query_pool.cl',
   'draw_helper.cl',
   'indirect_dispatch.cl',
+  'tessellation.cl',
 )
 
 idep_libpan_per_arch = {}
@@ -49,4 +50,3 @@ foreach ver : ['4', '5', '6', '7', '9', '10', '11', '12', '13', '14']
   )
   idep_libpan_per_arch += {ver: idep_libpan_cur_ver}
 endforeach
-

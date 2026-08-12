@@ -20,6 +20,7 @@
 #include "panvk_device.h"
 #include "panvk_meta.h"
 #include "panvk_shader.h"
+#include "pan_v9_trace.h"
 
 struct panvk_blend_shader_key {
    enum panvk_meta_object_key_type type;
@@ -320,14 +321,23 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
       rt_loc[i] = loc;
       loc_rt[loc] = i;
 
-      if (!(cb->color_write_enables & BITFIELD_BIT(i)))
-         continue;
+      PAN_V9_TRACE( "[PANVK_DEBUG_BLEND] rt=%u color_write_enables=0x%x fmt=%u write_mask=0x%x\n",
+              i, cb->color_write_enables, color_attachment_formats[i], cb->attachments[i].write_mask);
 
-      if (color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
+      if (!(cb->color_write_enables & BITFIELD_BIT(i))) {
+         PAN_V9_TRACE( "[PANVK_DEBUG_BLEND] rt=%u SKIP: color_write_enables\n", i);
          continue;
+      }
 
-      if (!cb->attachments[i].write_mask)
+      if (color_attachment_formats[i] == VK_FORMAT_UNDEFINED) {
+         PAN_V9_TRACE( "[PANVK_DEBUG_BLEND] rt=%u SKIP: format undefined\n", i);
          continue;
+      }
+
+      if (!cb->attachments[i].write_mask) {
+         PAN_V9_TRACE( "[PANVK_DEBUG_BLEND] rt=%u SKIP: write_mask zero\n", i);
+         continue;
+      }
 
       rt->format = vk_format_to_pipe_format(color_attachment_formats[i]);
 

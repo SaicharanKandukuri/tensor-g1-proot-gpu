@@ -41,6 +41,44 @@
 #include "vk_format.h"
 #include "vk_synchronization.h"
 
+void
+panvk_per_arch(kbase_mark_progress)(
+   struct panvk_cmd_buffer *cmdbuf, enum panvk_subqueue_id subqueue,
+   enum panvk_kbase_progress_marker marker)
+{
+   /* These stores are breadcrumbs for queue-hang diagnosis, not part of the
+    * queue ABI.  Keeping them in every draw/dispatch stream adds several LS
+    * instructions and a store flush at each marker, which is particularly
+    * costly for draw-heavy applications.  Keep the instrumentation opt-in. */
+   if (!PANVK_DEBUG(KBASE_DIAG))
+      return;
+
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   if (!phys_dev->kbase_node_path[0])
+      return;
+
+   enum {
+      KBASE_MARK_ADDR_REG = 14,
+      KBASE_MARK_VALUE_REG = 16,
+   };
+   STATIC_ASSERT(KBASE_MARK_ADDR_REG + 2 <= CS_REG_SCRATCH_COUNT);
+   STATIC_ASSERT(KBASE_MARK_VALUE_REG + 1 <= CS_REG_SCRATCH_COUNT);
+
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
+   struct cs_index addr = cs_scratch_reg64(b, KBASE_MARK_ADDR_REG);
+   struct cs_index value = cs_scratch_reg32(b, KBASE_MARK_VALUE_REG);
+
+   cs_load64_to(b, addr, cs_subqueue_ctx_reg(b),
+                offsetof(struct panvk_cs_subqueue_context,
+                         debug.kbase_progress_addr));
+   cs_move32_to(b, value, marker);
+   cs_store32(b, value, addr, 0);
+   cs_flush_stores(b);
+}
+
 static void
 emit_tls(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -105,7 +143,11 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, subqueue, PANVK_KBASE_PROGRESS_FINISH_BEFORE_WAIT);
    cs_wait_slots(b, dev->csf.sb.all_mask);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, subqueue, PANVK_KBASE_PROGRESS_FINISH_AFTER_WAIT);
 
    /* save CS error if non-zero */
    if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
@@ -188,6 +230,8 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    panvk_per_arch(panvk_instr_end_work)(
       subqueue, cmdbuf, PANVK_INSTR_WORK_TYPE_CMDBUF, &instr_info_cmdbuf);
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, subqueue, PANVK_KBASE_PROGRESS_CMDBUF_DONE);
    cs_end(&cmdbuf->state.cs[subqueue].builder);
 }
 
@@ -225,7 +269,7 @@ finish_queries(struct panvk_cmd_buffer *cmdbuf)
                    offsetof(struct panvk_cs_timestamp_query, avail));
 
       cs_move32_to(b, signal_val, 1);
-      cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, signal_val, syncobj,
+      cs_sync32_set(b, true, cmdbuf->sync_scope, signal_val, syncobj,
                     cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_SYNC)));
    }
 
@@ -259,6 +303,14 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
       struct cs_builder *b = &cmdbuf->state.cs[i].builder;
+
+      /* Builders are allocated lazily.  Don't turn an otherwise unused
+       * subqueue into a real submission just to append end-of-stream waits,
+       * cache maintenance and diagnostic breadcrumbs.  Besides the ring
+       * ioctl overhead, an unused stream used to execute a full L2/LSC clean
+       * on every command buffer. */
+      if (cs_is_empty(b))
+         continue;
 
       if (!cs_is_valid(b)) {
          vk_command_buffer_set_error(&cmdbuf->vk,
@@ -637,7 +689,7 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
          cs_add_imm64(b, sync_addr, sync_addr,
                       sizeof(struct panvk_cs_sync64) * i);
          cs_move64_to(b, add_val, 1);
-         panvk_instr_sync64_add(cmdbuf, i, true, MALI_CS_SYNC_SCOPE_CSG,
+         panvk_instr_sync64_add(cmdbuf, i, true, cmdbuf->sync_scope,
                                 add_val, sync_addr, cs_now());
          ++cs_state->relative_sync_point;
       }
@@ -788,7 +840,7 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
    };
 
    const struct drm_panthor_csif_info *csif_info =
-      panthor_kmod_get_csif_props(dev->kmod.dev);
+      panvk_get_csif_props(dev);
 
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
       struct cs_builder *b = &cmdbuf->state.cs[i].builder;
@@ -900,6 +952,14 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       return result;
    }
 
+   cmdbuf->sync_scope = MALI_CS_SYNC_SCOPE_CSG;
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(device->vk.physical);
+   if (phys_dev->kbase_node_path[0])
+      cmdbuf->sync_scope = MALI_CS_SYNC_SCOPE_SYSTEM;
+#endif
+
    list_inithead(&cmdbuf->push_sets);
    cmdbuf->vk.dynamic_graphics_state.vi = &cmdbuf->state.gfx.dynamic.vi;
    cmdbuf->vk.dynamic_graphics_state.ms.sample_locations =
@@ -980,9 +1040,10 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
          cmdbuf->state.cond_render.inherited = true;
    }
 
-   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
                                              PANVK_INSTR_WORK_TYPE_CMDBUF);
+   }
 
    return VK_SUCCESS;
 }
@@ -1023,6 +1084,13 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < commandBufferCount; i++) {
       VK_FROM_HANDLE(panvk_cmd_buffer, secondary, pCommandBuffers[i]);
+
+      if (UINT64_MAX - primary->state.tiler_work_estimate <
+          secondary->state.tiler_work_estimate)
+         primary->state.tiler_work_estimate = UINT64_MAX;
+      else
+         primary->state.tiler_work_estimate +=
+            secondary->state.tiler_work_estimate;
 
       /* make sure the CS context is setup properly
        * to inherit the primary command buffer state

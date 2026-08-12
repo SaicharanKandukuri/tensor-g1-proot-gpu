@@ -15,6 +15,7 @@
 #include "vk_android.h"
 #include "vk_device_memory.h"
 #include "vk_util.h"
+#include "util/u_gralloc/u_gralloc.h"
 
 bool
 panvk_android_is_gralloc_image(const VkImageCreateInfo *pCreateInfo)
@@ -258,7 +259,9 @@ panvk_android_import_ahb_memory(VkDevice device,
    VK_FROM_HANDLE(vk_device, dev, device);
    const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
    assert(handle && handle->numFds > 0);
-   int dma_buf_fd = handle->data[0];
+   int dma_buf_fd = u_gralloc_native_handle_dmabuf_fd(handle);
+   if (dma_buf_fd < 0)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    VkResult result;
 
    VkImage img_handle = VK_NULL_HANDLE;

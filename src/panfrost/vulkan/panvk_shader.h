@@ -111,6 +111,12 @@ struct panvk_common_sysvals_inner {
 
    /* Address of the shader constant data buffer */
    aligned_u64 constant_data;
+
+   /* libpoly state used by software geometry/tessellation stages.  Keeping
+    * these in the common block gives compute-lowered VS/TCS and the hardware
+    * VS-lowered TES identical offsets. */
+   aligned_u64 vertex_param_buffer_poly;
+   aligned_u64 tess_param_buffer_poly;
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
 struct panvk_common_sysvals {
@@ -160,6 +166,13 @@ struct panvk_graphics_sysvals {
    } vs;
 
    struct {
+      aligned_u64 base[MAX_XFB_BUFFERS];
+      aligned_u64 offset_ptr[MAX_XFB_BUFFERS];
+      uint32_t num_vertices;
+      uint32_t _pad;
+   } xfb;
+
+   struct {
       aligned_u64 blend_descs[MAX_RTS];
    } fs;
 
@@ -174,6 +187,15 @@ struct panvk_graphics_sysvals {
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_GFX_COUNT];
    } desc;
+#elif PAN_ARCH == 9
+   /* v9 Job Manager filters gl_Layer the same way as Bifrost (see
+    * lower_layer_writes in panvk_vX_shader.c); the field sits at the end so
+    * no other offset moves. */
+   int32_t layer_id;
+   /* gl_DrawID for v9 multi-draw: multi-draws are unrolled into one job per
+    * draw, and each draw gets its own push-uniform block, so the index is a
+    * plain per-draw sysval. Also keeps the struct 8-byte sized. */
+   int32_t draw_id;
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
@@ -386,6 +408,7 @@ struct panvk_shader_desc_info {
 
 struct panvk_shader_variant {
    struct pan_shader_info info;
+   uint16_t xfb_stride[MAX_XFB_BUFFERS];
 
    union {
       struct {
@@ -437,9 +460,40 @@ struct panvk_shader_variant {
    const char *asm_str;
 };
 
+struct panvk_tess_info {
+   enum tess_primitive_mode mode : 8;
+   enum gl_tess_spacing spacing : 8;
+   bool points;
+   bool ccw;
+};
+static_assert(sizeof(struct panvk_tess_info) == 4, "packed");
+
+static inline struct panvk_tess_info
+panvk_tess_info_merge(struct panvk_tess_info a, struct panvk_tess_info b)
+{
+   static_assert(TESS_PRIMITIVE_UNSPECIFIED == 0, "zero state");
+   static_assert(TESS_SPACING_UNSPECIFIED == 0, "zero state");
+
+   uint32_t x, y;
+   memcpy(&x, &a, sizeof(x));
+   memcpy(&y, &b, sizeof(y));
+   x |= y;
+
+   struct panvk_tess_info out;
+   memcpy(&out, &x, sizeof(out));
+   return out;
+}
+
 enum panvk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
    PANVK_VS_VARIANT_HW,
+
+   /* Vertex shader dispatched as compute for transform feedback. */
+   PANVK_VS_VARIANT_XFB,
+
+   /* Vertex shader dispatched as compute before a tessellation control
+    * shader. */
+   PANVK_VS_VARIANT_SW,
 
    PANVK_VS_VARIANTS,
 };
@@ -448,6 +502,18 @@ struct panvk_shader {
    struct vk_shader vk;
 
    struct panvk_shader_desc_info desc_info;
+
+   struct {
+      /* Vertex outputs consumed by the compute-lowered TCS path. */
+      uint64_t vs_outputs;
+
+      uint64_t tcs_per_vertex_outputs;
+      uint32_t tcs_output_stride;
+      uint8_t tcs_output_patch_size;
+      uint8_t tcs_nr_patch_outputs;
+
+      struct panvk_tess_info info;
+   } tess;
 
    struct panvk_shader_variant variants[];
 };
@@ -463,6 +529,8 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 
 static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_HW] = NULL,
+   [PANVK_VS_VARIANT_XFB] = "xfb",
+   [PANVK_VS_VARIANT_SW] = "tessellation",
 };
 
 static const char *
@@ -499,6 +567,25 @@ panvk_shader_hw_variant(const struct panvk_shader *shader)
       return NULL;
 
    return &shader->variants[0];
+}
+
+static const struct panvk_shader_variant *
+panvk_shader_xfb_variant(const struct panvk_shader *shader)
+{
+   if (!shader)
+      return NULL;
+
+   return &shader->variants[PANVK_VS_VARIANT_XFB];
+}
+
+static const struct panvk_shader_variant *
+panvk_shader_sw_variant(const struct panvk_shader *shader)
+{
+   if (!shader)
+      return NULL;
+
+   assert(shader->vk.stage == MESA_SHADER_VERTEX);
+   return &shader->variants[PANVK_VS_VARIANT_SW];
 }
 
 static inline uint64_t

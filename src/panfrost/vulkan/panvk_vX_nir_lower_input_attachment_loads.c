@@ -225,8 +225,15 @@ panvk_per_arch(nir_lower_input_attachment_loads)(
    uint32_t *input_attachment_read_out)
 {
    bool progress = false;
+   /* Read-only colour attachments are loaded with load_tile_res_pan, whose
+    * LD_TILE waits on the resource only (VA_FLOW_WAIT_RESOURCE). That flow
+    * exists from v10 on: va_insert_flow_control_nops() asserts it on v9, and
+    * any v9 shader reading a colour attachment it does not write aborted
+    * there (dEQP-VK.renderpasses.dynamic_rendering.*.local_read.* and
+    * *.attachment_sparse_filling.input_attachment_*). v9 uses the read-write
+    * load, with the full wait before LD_TILE, for every colour attachment. */
    struct panvk_lower_input_attachment_load_ctx ia_load_ctx = {
-      .ro_color_mask = readonly_color_mask(nir, state),
+      .ro_color_mask = PAN_ARCH >= 10 ? readonly_color_mask(nir, state) : 0,
    };
 
    NIR_PASS(progress, nir, nir_shader_intrinsics_pass,

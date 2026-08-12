@@ -86,7 +86,7 @@ fifthgen_archs = [12, 13, 14]
 fifthgen_inc_dir = ['fifthgen']
 fifthgen_files = []
 
-jm_archs = [6, 7]
+jm_archs = [6, 7, 9]  # PATCH: v9 (Mali-G57, Valhall) pakai submission JM, bukan CSF
 jm_inc_dir = ['jm']
 jm_files = [
   'jm/panvk_vX_cmd_buffer.c',
@@ -107,6 +107,7 @@ csf_files = [
   'csf/panvk_vX_cmd_dispatch.c',
   'csf/panvk_vX_cmd_draw.c',
   'csf/panvk_vX_cmd_event.c',
+  'csf/panvk_vX_cmd_xfb.c',
   'csf/panvk_vX_cmd_query.c',
   'csf/panvk_vX_cmd_precomp.c',
   'csf/panvk_vX_event.c',
@@ -142,7 +143,7 @@ common_per_arch_files = [
   sha1_h,
 ]
 
-foreach arch : [6, 7, 10, 11, 12, 13, 14]
+foreach arch : [6, 7, 9, 10, 11, 12, 13, 14]  # PATCH: tambah 9 (Mali-G57)
   per_arch_files = common_per_arch_files
   inc_panvk_per_arch = []
 
@@ -172,6 +173,7 @@ foreach arch : [6, 7, 10, 11, 12, 13, 14]
       inc_include,
       inc_src,
       inc_panfrost,
+      inc_poly,
       inc_panvk_per_arch,
     ],
     dependencies : [
@@ -217,6 +219,7 @@ libvulkan_panfrost = shared_library(
     libpanfrost_decode,
     libpanfrost_lib,
     libpanfrost_compiler,
+    libpoly_nir,
   ],
   dependencies : [
     dep_dl,
@@ -226,6 +229,7 @@ libvulkan_panfrost = shared_library(
     dep_thread,
     dep_valgrind,
     idep_nir,
+    idep_libpoly,
     idep_pan_packers,
     panvk_deps,
     idep_vulkan_util,

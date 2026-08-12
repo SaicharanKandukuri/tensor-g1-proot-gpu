@@ -52,6 +52,33 @@
 #include "vk_pipeline_layout.h"
 #include "vk_render_pass.h"
 #include "poly/geometry.h"
+#include "poly/tessellator.h"
+#include "libpan.h"
+
+/* On kbase, tiler-heap maintenance is done wholesale by the queue's heap
+ * renewal (TERM+INIT of the whole heap) rather than through the firmware
+ * per-render-pass protocol: the VT and fragment work run in separate CS
+ * groups there, so the VERTEX_TILER_STARTED/COMPLETED statistics (VT group)
+ * and FRAGMENT_COMPLETED credits (fragment group) accumulate against
+ * different heap generations.  The kernel validates the statistics reported
+ * with each tiler-OOM chunk request and terminates the group when they are
+ * inconsistent ("Invalid Heap statistics provided by firmware"), so on
+ * kbase we suppress VERTEX_TILER_COMPLETED, FRAGMENT_COMPLETED and
+ * FINISH_FRAGMENT heap maintenance.  VERTEX_TILER_STARTED alone is still
+ * emitted (from the VT stream): the same kernel validation also rejects
+ * requests with zero render passes in flight, so the started counter must
+ * advance; with the completed counters pinned at zero the statistics stay
+ * ordered and in-flight stays positive, while firmware chunk recycling
+ * remains disarmed. */
+static inline bool
+cmdbuf_skips_gpu_heap_ops(const struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   return phys_dev->kbase_node_path[0] != '\0';
+}
 
 static bool
 render_needs_zs_crc_ext(struct panvk_cmd_buffer *cmdbuf)
@@ -105,7 +132,7 @@ generate_fn_set_fbds_provoking_vertex(struct panvk_device *dev,
                                       uint32_t *dump_region_size)
 {
    const struct drm_panthor_csif_info *csif_info =
-      panthor_kmod_get_csif_props(dev->kmod.dev);
+      panvk_get_csif_props(dev);
 
    struct cs_builder b;
    struct cs_builder_conf conf = {
@@ -324,11 +351,13 @@ emit_vs_attrib(struct panvk_cmd_buffer *cmdbuf,
 }
 
 static VkResult
-prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf, uint32_t repeat_count)
+prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf,
+                      const struct panvk_shader *shader,
+                      struct panvk_shader_desc_state *shader_desc_state,
+                      uint32_t repeat_count)
 {
    const struct panvk_shader_desc_info *vs_desc_info =
-      &cmdbuf->state.gfx.vs.shader->desc_info;
-   struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
+      &shader->desc_info;
    const struct vk_dynamic_graphics_state *dyns =
       &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_vertex_input_state *vi = dyns->vi;
@@ -392,8 +421,8 @@ prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf, uint32_t repeat_count)
       descs += desc_count;
    }
 
-   vs_desc_state->driver_set.dev_addr = driver_set.gpu;
-   vs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   shader_desc_state->driver_set.dev_addr = driver_set.gpu;
+   shader_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
    gfx_state_set_dirty(cmdbuf, DESC_STATE);
    return VK_SUCCESS;
 }
@@ -440,7 +469,10 @@ prepare_vs_desc(struct panvk_cmd_buffer *cmdbuf,
    const uint32_t repeat_count =
       MAX2(cmdbuf->state.gfx.vs.desc_repeat_count, 1);
 
-   VkResult result = prepare_vs_driver_set(cmdbuf, repeat_count);
+   VkResult result = prepare_vs_driver_set(cmdbuf,
+                                           cmdbuf->state.gfx.vs.shader,
+                                           &cmdbuf->state.gfx.vs.desc,
+                                           repeat_count);
    if (result != VK_SUCCESS)
       return result;
 
@@ -599,6 +631,11 @@ prepare_descs(struct panvk_cmd_buffer *cmdbuf,
        fs_user_dirty(cmdbuf)) {
       uint32_t used_set_mask = vs->desc_info.used_set_mask;
       used_set_mask |= fs ? fs->desc_info.used_set_mask : 0;
+      if (cmdbuf->state.gfx.tess.input_vs)
+         used_set_mask |=
+            cmdbuf->state.gfx.tess.input_vs->desc_info.used_set_mask;
+      if (cmdbuf->state.gfx.tess.tcs)
+         used_set_mask |= cmdbuf->state.gfx.tess.tcs->desc_info.used_set_mask;
 
       result = panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state,
                                                       used_set_mask);
@@ -615,6 +652,64 @@ prepare_descs(struct panvk_cmd_buffer *cmdbuf,
       return result;
 
    return VK_SUCCESS;
+}
+
+static VkResult
+prepare_tess_compute_driver_set(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader *shader,
+   struct panvk_shader_desc_state *shader_desc_state)
+{
+   const struct panvk_shader_desc_info *desc_info = &shader->desc_info;
+   const uint32_t desc_count = desc_info->dyn_bufs.count + 1;
+   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE,
+      PANVK_DESCRIPTOR_SIZE);
+   struct panvk_opaque_desc *descs = driver_set.cpu;
+
+   if (!driver_set.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   pan_cast_and_pack(&descs[0], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
+   }
+
+   panvk_per_arch(cmd_fill_dyn_bufs)(
+      &cmdbuf->state.gfx.desc_state, desc_info,
+      (struct mali_buffer_packed *)&descs[1]);
+
+   shader_desc_state->driver_set.dev_addr = driver_set.gpu;
+   shader_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   return VK_SUCCESS;
+}
+
+static VkResult
+prepare_tess_descs(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   const struct panvk_shader *input_vs = gfx->tess.input_vs;
+   const struct panvk_shader *tcs = gfx->tess.tcs;
+   VkResult result;
+
+   if (!input_vs || !tcs)
+      return VK_SUCCESS;
+
+   result = prepare_vs_driver_set(cmdbuf, input_vs, &gfx->tess.vs_desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, &gfx->desc_state, &input_vs->desc_info,
+      &gfx->tess.vs_desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = prepare_tess_compute_driver_set(cmdbuf, tcs,
+                                             &gfx->tess.tcs_desc);
+   if (result != VK_SUCCESS)
+      return result;
+
+   return panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, &gfx->desc_state, &tcs->desc_info, &gfx->tess.tcs_desc, 1);
 }
 
 static bool
@@ -754,6 +849,8 @@ update_tls(struct panvk_cmd_buffer *cmdbuf)
    struct panvk_tls_state *state = &cmdbuf->state.tls;
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *xfb =
+      panvk_shader_xfb_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(get_fs(cmdbuf));
    struct cs_builder *b =
@@ -780,8 +877,10 @@ update_tls(struct panvk_cmd_buffer *cmdbuf)
       }
    }
 
-   state->info.tls.size =
-      MAX3(vs->info.tls_size, fs ? fs->info.tls_size : 0, state->info.tls.size);
+   state->info.tls.size = MAX3(
+      MAX2(vs ? vs->info.tls_size : 0,
+           xfb ? xfb->info.tls_size : 0),
+      fs ? fs->info.tls_size : 0, state->info.tls.size);
    return VK_SUCCESS;
 }
 
@@ -1423,6 +1522,15 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
    cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
                    cs_scratch_reg_tuple(b, 0, 2));
 
+   /* On kbase, VERTEX_TILER_STARTED is the only heap operation emitted (see
+    * cmdbuf_skips_gpu_heap_ops()): the kernel's tiler-OOM chunk-grow path
+    * rejects requests whose statistics show no render pass in flight
+    * ("Invalid Heap statistics provided by firmware: vt_start 0, vt_end 0,
+    * frag_end 0"), so the started counter must advance.  With no
+    * FRAGMENT_COMPLETED ever emitted, nr_in_flight = vt_start - frag_end
+    * stays positive and monotonically increasing, which both passes
+    * validation and keeps firmware chunk recycling disarmed (the heap is
+    * recycled wholesale by the queue's heap renewal instead). */
    cs_vt_start(b, cs_now());
    return VK_SUCCESS;
 }
@@ -3046,7 +3154,123 @@ update_prims_generated_query(struct panvk_cmd_buffer *cmdbuf,
    }
 }
 
+static VkResult
+launch_xfb(struct panvk_cmd_buffer *cmdbuf,
+           const struct panvk_draw_info *draw)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   const struct panvk_shader_variant *xfb =
+      panvk_shader_xfb_variant(gfx->vs.shader);
+
+   if (!gfx->xfb.enabled)
+      return VK_SUCCESS;
+
+   if (!panvk_priv_mem_check_alloc(xfb->code_mem))
+      return VK_SUCCESS;
+
+   /* The software XFB lowering currently launches one invocation per input
+    * vertex. This matches the existing Panfrost CSF path. Indexed draws will
+    * need a separate index-fetch lowering for strict Vulkan conformance. */
+   if (draw->indirect.buffer_dev_addr)
+      return VK_SUCCESS;
+
+   for (uint32_t i = 0; i < PANVK_MAX_XFB_BUFFERS; i++) {
+      gfx->sysvals.xfb.base[i] = gfx->xfb.buffers[i].address;
+      gfx->sysvals.xfb.offset_ptr[i] =
+         gfx->xfb.offsets.gpu + i * sizeof(uint32_t);
+   }
+   gfx->sysvals.xfb.num_vertices = draw->vertex.count;
+
+   struct pan_ptr xfb_push_uniforms;
+   VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+      cmdbuf, xfb, &xfb_push_uniforms, 1);
+   if (result != VK_SUCCESS)
+      return result;
+   gfx->xfb.push_uniforms = xfb_push_uniforms.gpu;
+
+   gfx->xfb.desc.driver_set = gfx->vs.desc.driver_set;
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, &gfx->desc_state, &gfx->vs.shader->desc_info,
+      &gfx->xfb.desc, 1);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct cs_builder *b =
+      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+   cs_update_compute_ctx(b) {
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SRT),
+                   gfx->xfb.desc.res_table);
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_FAU),
+                   gfx->xfb.push_uniforms |
+                      ((uint64_t)xfb->fau.total_count << 56));
+#if PAN_ARCH >= 12
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SPD),
+                   panvk_priv_mem_dev_addr(xfb->spds.all_triangles));
+#else
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_SPD),
+                   panvk_priv_mem_dev_addr(xfb->spds.pos_triangles));
+#endif
+      cs_move64_to(b, cs_reg64(b, PANVK_COMPUTE_TSD),
+                   cmdbuf->state.tls.desc.gpu);
+
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET),
+                   draw->vertex.base);
+
+      struct mali_compute_size_workgroup_packed wg_size;
+      pan_pack(&wg_size, COMPUTE_SIZE_WORKGROUP, cfg) {
+         cfg.workgroup_size_x = 1;
+         cfg.workgroup_size_y = 1;
+         cfg.workgroup_size_z = 1;
+         cfg.allow_merging_workgroups = true;
+      }
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, WG_SIZE), wg_size.opaque[0]);
+
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_X), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X),
+                   draw->vertex.count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y),
+                   draw->instance.count);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
+   }
+
+   cs_run_compute(b, 1, MALI_TASK_AXIS_Z, PANVK_COMPUTE_RES_SEL);
+   cs_wait_slots(b, dev->csf.sb.all_iters_mask);
+
+   struct cs_index offsets_addr = cs_scratch_reg64(b, 0);
+   struct cs_index offset = cs_scratch_reg32(b, 2);
+   cs_move64_to(b, offsets_addr, gfx->xfb.offsets.gpu);
+
+   for (uint32_t i = 0; i < PANVK_MAX_XFB_BUFFERS; i++) {
+      if (!xfb->xfb_stride[i])
+         continue;
+
+      const uint32_t bytes_written =
+         draw->vertex.count * draw->instance.count *
+         xfb->xfb_stride[i];
+      cs_load32_to(b, offset, offsets_addr, i * sizeof(uint32_t));
+      cs_flush_loads(b);
+      cs_add_imm32(b, offset, offset, bytes_written);
+      cs_store32(b, offset, offsets_addr, i * sizeof(uint32_t));
+   }
+   cs_flush_stores(b);
+
+   return VK_SUCCESS;
+}
+
 static void
+account_tiler_work(struct panvk_cmd_buffer *cmdbuf, uint64_t work)
+{
+   if (UINT64_MAX - cmdbuf->state.tiler_work_estimate < work)
+      cmdbuf->state.tiler_work_estimate = UINT64_MAX;
+   else
+      cmdbuf->state.tiler_work_estimate += work;
+}
+
+static VkResult
 launch_gfx_cs(struct panvk_cmd_buffer *cmdbuf,
               const struct panvk_shader_variant *cs,
               const struct panvk_shader_desc_state *cs_desc_state,
@@ -3063,9 +3287,20 @@ launch_gfx_cs(struct panvk_cmd_buffer *cmdbuf,
       VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
          cmdbuf, cs, &push_uniforms_ptr, 1);
       if (result != VK_SUCCESS)
-         return;
+         return result;
       push_uniforms = push_uniforms_ptr.gpu;
    }
+
+   struct pan_compute_dim dim = {
+      .x = info->direct.wg_count.x,
+      .y = info->direct.wg_count.y,
+      .z = info->direct.wg_count.z,
+   };
+   const bool indirect = info->indirect.buffer_dev_addr != 0;
+   uint64_t tsd = panvk_per_arch(cmd_dispatch_prepare_tls)(
+      cmdbuf, cs, &dim, indirect);
+   if (!tsd)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    /* Dirty everything */
    compute_state_set_dirty(cmdbuf, CS);
@@ -3073,13 +3308,286 @@ launch_gfx_cs(struct panvk_cmd_buffer *cmdbuf,
    compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
 
    panvk_per_arch(cmd_dispatch_shader)(cmdbuf, cs, cs_desc_state,
-                                       push_uniforms, cmdbuf->state.gfx.tsd,
+                                       push_uniforms, tsd,
                                        info);
 
    /* Dirty everything */
    compute_state_set_dirty(cmdbuf, CS);
    compute_state_set_dirty(cmdbuf, DESC_STATE);
    compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
+   return VK_SUCCESS;
+}
+
+static void
+reset_poly_heap_once(struct panvk_cmd_buffer *cmdbuf)
+{
+   if (cmdbuf->state.uses_poly_heap)
+      return;
+
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_cs_deps deps = {0};
+   deps.dst[PANVK_SUBQUEUE_COMPUTE].wait_subqueue_mask =
+      BITFIELD_MASK(PANVK_SUBQUEUE_COUNT) &
+      ~BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+   u_foreach_bit(i, deps.dst[PANVK_SUBQUEUE_COMPUTE].wait_subqueue_mask)
+      deps.src[i].wait_sb_mask = dev->csf.sb.all_iters_mask;
+   panvk_per_arch(emit_barrier)(cmdbuf, deps);
+
+   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   panlib_fill_scalar(
+      &ctx, panlib_1d(1), PANLIB_BARRIER_CSF_WAIT,
+      dev->poly_heap->addr.dev + offsetof(struct poly_heap, bottom), 0);
+   cmdbuf->state.uses_poly_heap = true;
+}
+
+static void
+launch_tessellator(struct panvk_cmd_buffer *cmdbuf, uint32_t patch_count,
+                   enum tess_primitive_mode mode, uint64_t params,
+                   enum poly_tess_mode tess_mode)
+{
+   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   struct panlib_precomp_grid grid = panlib_1d(DIV_ROUND_UP(patch_count, 64));
+
+   switch (mode) {
+   case TESS_PRIMITIVE_ISOLINES:
+      panlib_tess_isoline(&ctx, grid, PANLIB_BARRIER_CSF_WAIT, params,
+                          tess_mode);
+      break;
+   case TESS_PRIMITIVE_TRIANGLES:
+      panlib_tess_tri(&ctx, grid, PANLIB_BARRIER_CSF_WAIT, params, tess_mode);
+      break;
+   case TESS_PRIMITIVE_QUADS:
+      panlib_tess_quad(&ctx, grid, PANLIB_BARRIER_CSF_WAIT, params, tess_mode);
+      break;
+   default:
+      UNREACHABLE("invalid tessellation primitive mode");
+   }
+}
+
+/* The libpoly sequence is a chain of independent compute dispatches.  Waiting
+ * for the previous iteration only establishes execution ordering on CSF; it
+ * does not make global stores from one shader visible to shader cores running
+ * the next dispatch.  Clean and invalidate between producer/consumer stages.
+ */
+static void
+tess_compute_memory_barrier(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_cs_deps deps = {0};
+
+   deps.src[PANVK_SUBQUEUE_COMPUTE].wait_sb_mask =
+      dev->csf.sb.all_iters_mask;
+   deps.src[PANVK_SUBQUEUE_COMPUTE].cache_flush =
+      (struct panvk_cache_flush_info){
+         .l2 = MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
+         .lsc = MALI_CS_FLUSH_MODE_CLEAN_AND_INVALIDATE,
+         .others = MALI_CS_OTHER_FLUSH_MODE_NONE,
+      };
+   panvk_per_arch(emit_barrier)(cmdbuf, deps);
+}
+
+static VkResult
+launch_tess(struct panvk_cmd_buffer *cmdbuf,
+            const struct panvk_draw_info *in,
+            struct panvk_draw_info *out)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   const struct panvk_shader *input_vs = gfx->tess.input_vs;
+   const struct panvk_shader *tcs = gfx->tess.tcs;
+   const struct panvk_shader *tes = gfx->tess.tes;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmdbuf->vk.dynamic_graphics_state;
+
+   if (!input_vs || !tcs || !tes || in->indirect.buffer_dev_addr)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   const uint32_t input_patch_size = dyn->ts.patch_control_points;
+   if (!input_patch_size || !tcs->tess.tcs_output_patch_size)
+      return VK_ERROR_UNKNOWN;
+
+   const uint32_t patches_per_instance =
+      in->vertex.count / input_patch_size;
+   const uint32_t patch_count = patches_per_instance * in->instance.count;
+   if (!patch_count) {
+      *out = *in;
+      out->vertex.count = 0;
+      return VK_SUCCESS;
+   }
+
+   reset_poly_heap_once(cmdbuf);
+
+   const uint32_t vs_wg_size[3] = {1, 1, 1};
+   struct poly_vertex_params vertex_params;
+   poly_vertex_params_init(&vertex_params, input_vs->tess.vs_outputs,
+                           vs_wg_size);
+   poly_vertex_params_set_draw(&vertex_params, in->vertex.count,
+                               in->instance.count);
+
+   if (in->index.index_size) {
+      const uint64_t index_offs =
+         (uint64_t)in->index.offset * in->index.index_size;
+      vertex_params.index_buffer = in->index.buffer_dev_addr + index_offs;
+      vertex_params.index_size_B = in->index.index_size;
+      vertex_params.index_buffer_range_el =
+         index_offs < in->index.buffer_size
+            ? (in->index.buffer_size - index_offs) / in->index.index_size
+            : 0;
+   }
+
+   const uint64_t vs_output_size = poly_tcs_in_size(
+      in->vertex.count * in->instance.count, input_vs->tess.vs_outputs);
+   struct pan_ptr vs_output = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, MAX2(vs_output_size, 16), 16);
+   if (!vs_output.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   vertex_params.output_buffer = vs_output.gpu;
+
+   struct pan_ptr vertex_params_ptr = panvk_cmd_upload_dev_mem(
+      cmdbuf, desc, &vertex_params, sizeof(vertex_params), 8);
+   if (!vertex_params_ptr.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct panvk_tess_info info =
+      panvk_tess_info_merge(tcs->tess.info, tes->tess.info);
+   enum poly_tess_partitioning partitioning =
+      info.spacing == TESS_SPACING_EQUAL
+         ? POLY_TESS_PARTITIONING_INTEGER
+      : info.spacing == TESS_SPACING_FRACTIONAL_ODD
+         ? POLY_TESS_PARTITIONING_FRACTIONAL_ODD
+         : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
+
+   struct poly_tess_params tess_params = {
+      .heap = dev->poly_heap->addr.dev,
+      .patch_coord_buffer =
+         dev->poly_heap->addr.dev + sizeof(struct poly_heap),
+      .tcs_stride_el = tcs->tess.tcs_output_stride / 4,
+      .input_patch_size = input_patch_size,
+      .output_patch_size = tcs->tess.tcs_output_patch_size,
+      .tcs_patch_constants = tcs->tess.tcs_nr_patch_outputs,
+      .tcs_per_vertex_outputs = tcs->tess.tcs_per_vertex_outputs,
+      .patches_per_instance = patches_per_instance,
+      .nr_patches = patch_count,
+      .partitioning = partitioning,
+      .points_mode = info.points,
+      .isolines = info.mode == TESS_PRIMITIVE_ISOLINES,
+   };
+
+   if (!tess_params.points_mode &&
+       info.mode != TESS_PRIMITIVE_ISOLINES) {
+      tess_params.ccw = info.ccw;
+      tess_params.ccw ^=
+         dyn->ts.domain_origin ==
+         VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+   }
+
+   uint64_t alloc = 0;
+   const uint64_t tcs_out_offs = alloc;
+   alloc += (uint64_t)patch_count * tess_params.tcs_stride_el * 4;
+   const uint64_t coord_allocs_offs = alloc;
+   alloc += (uint64_t)patch_count * sizeof(uint32_t);
+   const uint64_t counts_offs = alloc;
+   alloc += (uint64_t)patch_count * sizeof(uint32_t);
+   const uint64_t draw_offs = alloc;
+   alloc += sizeof(VkDrawIndexedIndirectCommand);
+
+   struct pan_ptr tess_storage =
+      panvk_cmd_alloc_dev_mem(cmdbuf, desc, alloc, 16);
+   if (!tess_storage.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   tess_params.tcs_buffer = tess_storage.gpu + tcs_out_offs;
+   tess_params.coord_allocs = tess_storage.gpu + coord_allocs_offs;
+   tess_params.counts = tess_storage.gpu + counts_offs;
+   tess_params.out_draws = tess_storage.gpu + draw_offs;
+
+   struct pan_ptr tess_params_ptr = panvk_cmd_upload_dev_mem(
+      cmdbuf, desc, &tess_params, sizeof(tess_params), 8);
+   if (!tess_params_ptr.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   gfx->sysvals.common.vertex_param_buffer_poly = vertex_params_ptr.gpu;
+   gfx->sysvals.common.tess_param_buffer_poly = tess_params_ptr.gpu;
+
+   struct pan_ptr push;
+   VkResult result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+      cmdbuf, panvk_shader_sw_variant(input_vs), &push, 1);
+   if (result != VK_SUCCESS)
+      return result;
+   gfx->tess.vs_push_uniforms = push.gpu;
+
+   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+      cmdbuf, panvk_shader_only_variant(tcs), &push, 1);
+   if (result != VK_SUCCESS)
+      return result;
+   gfx->tess.tcs_push_uniforms = push.gpu;
+
+   struct panvk_dispatch_info dispatch = {
+      .direct.wg_count = {
+         in->vertex.count,
+         in->instance.count,
+         1,
+      },
+      .barrier = PANVK_CSF_BARRIER_WAIT,
+   };
+   result = launch_gfx_cs(cmdbuf, panvk_shader_sw_variant(input_vs),
+                          &gfx->tess.vs_desc,
+                          gfx->tess.vs_push_uniforms, &dispatch);
+   if (result != VK_SUCCESS)
+      return result;
+   tess_compute_memory_barrier(cmdbuf);
+
+   dispatch.direct.wg_count.x = patches_per_instance;
+   dispatch.direct.wg_count.y = in->instance.count;
+   result = launch_gfx_cs(cmdbuf, panvk_shader_only_variant(tcs),
+                          &gfx->tess.tcs_desc,
+                          gfx->tess.tcs_push_uniforms, &dispatch);
+   if (result != VK_SUCCESS)
+      return result;
+   tess_compute_memory_barrier(cmdbuf);
+
+   launch_tessellator(cmdbuf, patch_count, info.mode, tess_params_ptr.gpu,
+                      POLY_TESS_MODE_COUNT);
+   tess_compute_memory_barrier(cmdbuf);
+   struct panvk_precomp_ctx precomp_ctx =
+      panvk_per_arch(precomp_cs)(cmdbuf);
+   panlib_prefix_sum_tess(&precomp_ctx, panlib_1d(1),
+                          PANLIB_BARRIER_CSF_WAIT, tess_params_ptr.gpu);
+   tess_compute_memory_barrier(cmdbuf);
+   launch_tessellator(cmdbuf, patch_count, info.mode, tess_params_ptr.gpu,
+                      POLY_TESS_MODE_WITH_COUNTS);
+
+   struct panvk_cs_deps deps = {0};
+   deps.src[PANVK_SUBQUEUE_COMPUTE].wait_sb_mask = dev->csf.sb.all_iters_mask;
+   deps.src[PANVK_SUBQUEUE_COMPUTE].cache_flush = (struct panvk_cache_flush_info){
+      .l2 = MALI_CS_FLUSH_MODE_CLEAN,
+      .lsc = MALI_CS_FLUSH_MODE_CLEAN,
+      .others = MALI_CS_OTHER_FLUSH_MODE_NONE,
+   };
+   deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask =
+      BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+   panvk_per_arch(emit_barrier)(cmdbuf, deps);
+
+   gfx->tess.info = info;
+   gfx->tess.prim = info.points
+      ? MESA_PRIM_POINTS
+      : info.mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                             : MESA_PRIM_TRIANGLES;
+
+   *out = (struct panvk_draw_info){
+      .index = {
+         .buffer_dev_addr = dev->poly_heap->addr.dev + sizeof(struct poly_heap),
+         .buffer_size = pan_kmod_bo_size(dev->poly_heap->bo) -
+                        sizeof(struct poly_heap),
+         .index_size = 4,
+      },
+      .indirect = {
+         .buffer_dev_addr = tess_params.out_draws,
+         .draw_count = 1,
+         .stride = sizeof(VkDrawIndexedIndirectCommand),
+      },
+      .prim = gfx->tess.prim,
+   };
+   return VK_SUCCESS;
 }
 
 static void
@@ -3124,6 +3632,10 @@ launch_draw(struct panvk_cmd_buffer *cmdbuf,
       dynamic_idvs_count = true;
 #endif
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_BEFORE_RUN_IDVS);
 
    panvk_cond_render(cmdbuf, b)
    {
@@ -3184,6 +3696,10 @@ launch_draw(struct panvk_cmd_buffer *cmdbuf,
 #endif
       }
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_RUN_IDVS);
 }
 
 static void
@@ -3464,8 +3980,14 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info draw)
    VkResult result;
 
    /* If there's no vertex shader, we can skip the draw. */
-   if (!panvk_priv_mem_check_alloc(vs->spd))
+   if (!vs || !panvk_priv_mem_check_alloc(vs->spd))
       return;
+
+   if (draw.indirect.buffer_dev_addr)
+      account_tiler_work(cmdbuf, (uint64_t)draw.indirect.draw_count * 256);
+   else
+      account_tiler_work(cmdbuf,
+                         (uint64_t)draw.vertex.count * draw.instance.count);
 
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
@@ -3486,9 +4008,41 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info draw)
       gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
    }
 
+   const bool tess = cmdbuf->state.gfx.tess.tes != NULL;
+
+   /* Compute-lowered VS/TCS consume the API draw sysvals, before the draw is
+    * transformed into the tessellator's indexed indirect draw. */
+   if (tess)
+      panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, &draw,
+                                               panvk_shader_only_variant(
+                                                  get_fs(cmdbuf)));
+
    result = prepare_descs(cmdbuf, &draw);
    if (result != VK_SUCCESS)
       return;
+
+   if (tess) {
+      result = prepare_tess_descs(cmdbuf);
+      if (result != VK_SUCCESS)
+         return;
+
+      struct panvk_draw_info tess_draw;
+      result = launch_tess(cmdbuf, &draw, &tess_draw);
+      if (result != VK_SUCCESS)
+         return;
+      draw = tess_draw;
+
+      if (!draw.vertex.count && !draw.indirect.buffer_dev_addr)
+         return;
+
+      /* prepare_draw() patches indirect draw FAUs, so make sure it gets a
+       * fresh block for the generated command. */
+      gfx_state_set_dirty(cmdbuf, BASE_INSTANCE);
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+      result = prepare_descs(cmdbuf, &draw);
+      if (result != VK_SUCCESS)
+         return;
+   }
 
    /* For indirect draws, we need to patch the descriptors we just emitted */
    if (draw.indirect.buffer_dev_addr)
@@ -3497,6 +4051,12 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info draw)
    result = prepare_draw(cmdbuf, &draw);
    if (result != VK_SUCCESS)
       return;
+
+   if (!tess) {
+      result = launch_xfb(cmdbuf, &draw);
+      if (result != VK_SUCCESS)
+         return;
+   }
 
    update_prims_generated_query(cmdbuf, &draw);
 
@@ -4212,7 +4772,13 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
       return;
 
    /* Flush the tiling operations and signal the internal sync object. */
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_BEFORE_FINISH_TILING);
    cs_finish_tiling(b);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_FINISH_TILING);
 
    /* We're relying on PANVK_SUBQUEUE_VERTEX_TILER being the first queue to
     * skip an ADD operation on the syncobjs pointer. */
@@ -4226,10 +4792,17 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
                 offsetof(struct panvk_cs_subqueue_context, syncobjs));
 
    cs_move64_to(b, add_val, 1);
-   cs_vt_end(b, cs_defer_indirect());
+   if (!cmdbuf_skips_gpu_heap_ops(cmdbuf))
+      cs_vt_end(b, cs_defer_indirect());
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
    panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
-                          MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
+                          cmdbuf->sync_scope, add_val, sync_addr,
                           cs_defer_indirect());
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+      PANVK_KBASE_PROGRESS_VT_AFTER_SYNC_SIGNAL);
 #else
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
@@ -4243,10 +4816,17 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
    cs_move64_to(b, add_val, 1);
 
    cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
-      cs_vt_end(b, cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      if (!cmdbuf_skips_gpu_heap_ops(cmdbuf))
+         cs_vt_end(b, cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      panvk_per_arch(kbase_mark_progress)(
+         cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+         PANVK_KBASE_PROGRESS_VT_AFTER_VT_END);
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
+                             cmdbuf->sync_scope, add_val, sync_addr,
                              cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      panvk_per_arch(kbase_mark_progress)(
+         cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
+         PANVK_KBASE_PROGRESS_VT_AFTER_SYNC_SIGNAL);
    }
 #endif
 
@@ -4483,6 +5063,9 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_FRAGMENT);
    bool has_oq_chain = cmdbuf->state.gfx.render.oq.chain != 0;
 
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT, PANVK_KBASE_PROGRESS_FRAG_ENTER);
+
    /* Now initialize the fragment bits. */
    cs_update_frag_ctx(b) {
 #if PAN_ARCH >= 14
@@ -4525,19 +5108,31 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
 
    /* Enable the oom handler before waiting for the vertex/tiler work.
     * At this point, the tiler oom context has been set up with the correct
-    * state for this renderpass, so it's safe to enable. */
+    * state for this renderpass, so it's safe to enable.
+    * On kbase the incremental-rendering handler is never registered: heap
+    * maintenance is renewal-based there (see cmdbuf_skips_gpu_heap_ops())
+    * and the handler would emit the FINISH_FRAGMENT/HEAP_OPERATION
+    * sequences we deliberately suppress. */
    struct cs_index addr_reg = cs_scratch_reg64(b, 0);
    struct cs_index length_reg = cs_scratch_reg32(b, 2);
-   uint32_t handler_idx = calc_tiler_oom_handler_idx(cmdbuf);
-   uint64_t handler_addr = dev->tiler_oom.handlers_bo->addr.dev +
-                           handler_idx * dev->tiler_oom.handler_stride;
-   cs_move64_to(b, addr_reg, handler_addr);
-   cs_move32_to(b, length_reg, dev->tiler_oom.handler_stride);
-   cs_set_exception_handler(b, MALI_CS_EXCEPTION_TYPE_TILER_OOM, addr_reg,
-                            length_reg);
+   if (!cmdbuf_skips_gpu_heap_ops(cmdbuf)) {
+      uint32_t handler_idx = calc_tiler_oom_handler_idx(cmdbuf);
+      uint64_t handler_addr = dev->tiler_oom.handlers_bo->addr.dev +
+                              handler_idx * dev->tiler_oom.handler_stride;
+      cs_move64_to(b, addr_reg, handler_addr);
+      cs_move32_to(b, length_reg, dev->tiler_oom.handler_stride);
+      cs_set_exception_handler(b, MALI_CS_EXCEPTION_TYPE_TILER_OOM, addr_reg,
+                               length_reg);
+   }
 
    /* Wait for the tiling to be done before submitting the fragment job. */
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_BEFORE_TILING_WAIT);
    wait_finish_tiling(cmdbuf);
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_TILING_WAIT);
 
    /* Disable the oom handler once the vertex/tiler work has finished.
     * We need to disable the handler at this point as the vertex/tiler subqueue
@@ -4549,8 +5144,9 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
     * up. */
    cs_move64_to(b, addr_reg, 0);
    cs_move32_to(b, length_reg, 0);
-   cs_set_exception_handler(b, MALI_CS_EXCEPTION_TYPE_TILER_OOM, addr_reg,
-                            length_reg);
+   if (!cmdbuf_skips_gpu_heap_ops(cmdbuf))
+      cs_set_exception_handler(b, MALI_CS_EXCEPTION_TYPE_TILER_OOM, addr_reg,
+                               length_reg);
 
    /* Applications tend to forget to describe subpass dependencies, especially
     * when it comes to write -> read dependencies on attachments. The
@@ -4566,6 +5162,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    }
 
    struct cs_index fbd_pointer = cs_sr_reg64(b, FRAGMENT, FBD_POINTER);
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_BEFORE_RUN);
 
    if (cmdbuf->state.gfx.render.layer_count <= 1) {
 #if PAN_ARCH >= 14
@@ -4604,6 +5204,9 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    /* CRC becomes valid only after full-frame fragment completion without IR. */
    mark_crc_valid_after_fragment(b, cmdbuf);
 #endif
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_RUN);
 
    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
    struct cs_index sb_update_scratch_regs = cs_scratch_reg_tuple(b, 2, 2);
@@ -4655,7 +5258,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
          cs_defer(SB_WAIT_ITER(sb_upd_ctx.cur_sb), SB_ITER(sb_upd_ctx.next_sb));
 #endif
 
-      if (td_count == 1) {
+      if (cmdbuf_skips_gpu_heap_ops(cmdbuf)) {
+         /* Heap chunks are reclaimed by the queue's wholesale heap renewal
+          * instead of FINISH_FRAGMENT/FRAGMENT_COMPLETED. */
+      } else if (td_count == 1) {
          cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);
          cs_finish_fragment(b, true, completed_top, completed_bottom, async);
       } else if (td_count > 1) {
@@ -4678,7 +5284,7 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
 #endif
 
       if (free_render_descs) {
-         cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, release_sz,
+         cs_sync32_add(b, true, cmdbuf->sync_scope, release_sz,
                        ringbuf_sync_addr, async);
       }
 
@@ -4719,14 +5325,18 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
                                            struct panvk_cs_occlusion_query, node) {
             cs_load64_to(b, oq_syncobj, oq_chain,
                          offsetof(struct panvk_cs_occlusion_query, syncobj));
-            cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, add_val_lo, oq_syncobj,
+            cs_sync32_set(b, true, cmdbuf->sync_scope, add_val_lo, oq_syncobj,
                           cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
          }
       }
 
       panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr, async);
+                             cmdbuf->sync_scope, add_val, sync_addr, async);
    }
+
+   panvk_per_arch(kbase_mark_progress)(
+      cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
+      PANVK_KBASE_PROGRESS_FRAG_AFTER_FINISH);
 
    /* Update the ring buffer position. */
    if (free_render_descs) {

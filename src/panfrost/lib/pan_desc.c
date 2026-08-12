@@ -17,6 +17,7 @@
 #include "pan_texture.h"
 #include "pan_trace.h"
 #include "pan_util.h"
+#include "pan_v9_trace.h"
 
 #define PAN_BIN_LEVEL_COUNT 12
 
@@ -930,6 +931,8 @@ GENX(pan_emit_linear_color_attachment)(const struct pan_attachment_info *att,
       cfg.writeback_buffer.base = base;
       cfg.writeback_buffer.row_stride = row_stride;
       cfg.writeback_buffer.surface_stride = surf_stride;
+      PAN_V9_TRACE( "[PANVK_DEBUG_RT] linear color attachment base=0x%lx row_stride=%lu surf_stride=%lu\n",
+              (unsigned long)base, (unsigned long)row_stride, (unsigned long)surf_stride);
    }
 }
 

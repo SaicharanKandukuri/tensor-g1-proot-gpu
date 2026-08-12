@@ -6,6 +6,7 @@
 #ifndef PANVK_PHYSICAL_DEVICE_H
 #define PANVK_PHYSICAL_DEVICE_H
 
+#include "util/u_debug.h"
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -48,6 +49,12 @@ struct panvk_physical_device {
       dev_t primary_rdev;
       dev_t render_rdev;
    } drm;
+
+   /* Device node path for kbase (non-DRM) devices, e.g. "/dev/mali0";
+    * empty for DRM devices.  Logical devices must open() a fresh fd from
+    * this path: dup()ing the physical device fd would share the kbase
+    * context, whose version handshake can only be performed once. */
+   char kbase_node_path[32];
 
    struct {
       const struct pan_blendable_format *blendable;
@@ -94,6 +101,43 @@ VkResult panvk_physical_device_init(struct panvk_physical_device *device,
                                     struct panvk_instance *instance,
                                     drmDevicePtr drm_device);
 
+#if defined(HAVE_PAN_KMOD_KBASE)
+VkResult panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+                                          struct panvk_instance *instance,
+                                          const char *path);
+
+#define PANVK_KBASE_SYNC_TARGET_COUNT 3
+
+typedef VkResult (*panvk_kbase_sync_wait_func)(
+   void *data,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+   uint64_t abs_timeout_ns);
+
+/* Turn a pending payload into a sync_file: *sync_file is a new fd, or -1 if
+ * the work has already completed. */
+typedef VkResult (*panvk_kbase_sync_export_func)(
+   void *data,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+   int *sync_file);
+
+void panvk_kbase_sync_set_pending(
+   struct vk_sync *sync, void *data, panvk_kbase_sync_wait_func wait,
+   panvk_kbase_sync_export_func export_fn,
+   const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT]);
+
+/* What a submit has to wait for before it may run. */
+enum panvk_kbase_sync_payload {
+   PANVK_KBASE_SYNC_PAYLOAD_NONE,    /* signalled: nothing to wait for */
+   PANVK_KBASE_SYNC_PAYLOAD_GPU,     /* our submitted work: *data, targets */
+   PANVK_KBASE_SYNC_PAYLOAD_FILE,    /* an imported sync_file: *sync_file = dup */
+   PANVK_KBASE_SYNC_PAYLOAD_OTHER,   /* anything else: wait on the CPU */
+};
+
+enum panvk_kbase_sync_payload panvk_kbase_sync_get_payload(
+   struct vk_sync *sync, void **data,
+   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT], int *sync_file);
+#endif
+
 void panvk_physical_device_finish(struct panvk_physical_device *device);
 
 
@@ -123,5 +167,18 @@ void panvk_per_arch(get_physical_device_properties)(
    const struct panvk_physical_device *device,
    struct vk_properties *properties);
 #endif
+
+/* EXPERIMENTAL v9: sampler min/max reduction (samplerFilterMinmax) and
+ * cubic filtering (VK_EXT_filter_cubic) are emulated in the shader
+ * (panvk_v9_nir_lower_minmax.h). Off by default: once active, every float
+ * texture sample of every shader carries the emulation code (a one-sample
+ * fragment shader grew from 256 to 7552 bytes). PANVK_V9_EMULATE_SAMPLER=1
+ * exposes the features; the pass then only runs on devices that enable
+ * them. */
+static inline bool
+panvk_v9_sampler_emulation_exposed(unsigned arch)
+{
+   return arch == 9 && debug_get_bool_option("PANVK_V9_EMULATE_SAMPLER", false);
+}
 
 #endif

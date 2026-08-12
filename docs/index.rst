@@ -86,6 +86,7 @@ Linux, FreeBSD, and other operating systems.
    drivers/lima
    drivers/llvmpipe
    drivers/nvk
+   panvk-kbase
    drivers/panfrost
    drivers/powervr
    drivers/radv
