@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <stddef.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include "util/cnd_monotonic.h"
@@ -41,13 +42,54 @@
 #include "util/timespec.h"
 #include "pan_v9_trace.h"
 
-struct panvk_kbase_event_v2 {
-   uint32_t event_code;
-   uint8_t atom_number;
-   uint8_t padding[3];
-   uint64_t udata[2];
-};
-
+_Static_assert(sizeof(void *) == 8, "kbase JM requires 64-bit userspace");
+_Static_assert(sizeof(base_jd_atom) == 64, "base_jd_atom ABI");
+_Static_assert(_Alignof(base_jd_atom) == 8, "base_jd_atom alignment");
+_Static_assert(offsetof(base_jd_atom, jc) == 8, "base_jd_atom.jc ABI");
+_Static_assert(offsetof(base_jd_atom, pre_dep) == 44,
+               "base_jd_atom.pre_dep ABI");
+_Static_assert(offsetof(base_jd_atom, atom_number) == 48,
+               "base_jd_atom.atom_number ABI");
+_Static_assert(offsetof(base_jd_atom, core_req) == 52,
+               "base_jd_atom.core_req ABI");
+_Static_assert(sizeof(struct base_jd_event_v2) == 24, "base_jd_event_v2 ABI");
+_Static_assert(offsetof(struct base_jd_event_v2, event_code) == 0,
+               "base_jd_event_v2.event_code ABI");
+_Static_assert(offsetof(struct base_jd_event_v2, atom_number) == 4,
+               "base_jd_event_v2.atom_number ABI");
+_Static_assert(offsetof(struct base_jd_event_v2, udata) == 8,
+               "base_jd_event_v2.udata ABI");
+_Static_assert(sizeof(struct base_fence) == 8, "base_fence ABI");
+_Static_assert(__builtin_offsetof(struct base_fence, basep.fd) == 0,
+               "base_fence.fd ABI");
+_Static_assert(__builtin_offsetof(struct base_fence, basep.stream_fd) == 4,
+               "base_fence.stream_fd ABI");
+_Static_assert(sizeof(struct kbase_ioctl_job_submit) == 16,
+               "kbase_ioctl_job_submit ABI");
+_Static_assert(offsetof(struct kbase_ioctl_job_submit, addr) == 0,
+               "kbase_ioctl_job_submit.addr ABI");
+_Static_assert(offsetof(struct kbase_ioctl_job_submit, nr_atoms) == 8,
+               "kbase_ioctl_job_submit.nr_atoms ABI");
+_Static_assert(offsetof(struct kbase_ioctl_job_submit, stride) == 12,
+               "kbase_ioctl_job_submit.stride ABI");
+_Static_assert(_IOC_TYPE(KBASE_IOCTL_JOB_SUBMIT) == KBASE_IOCTL_TYPE,
+               "KBASE_IOCTL_JOB_SUBMIT type ABI");
+_Static_assert(_IOC_NR(KBASE_IOCTL_JOB_SUBMIT) == 2,
+               "KBASE_IOCTL_JOB_SUBMIT number ABI");
+_Static_assert(_IOC_DIR(KBASE_IOCTL_JOB_SUBMIT) == _IOC_WRITE,
+               "KBASE_IOCTL_JOB_SUBMIT direction ABI");
+_Static_assert(_IOC_SIZE(KBASE_IOCTL_JOB_SUBMIT) == 16,
+               "KBASE_IOCTL_JOB_SUBMIT size ABI");
+_Static_assert(BASE_JD_DEP_TYPE_DATA == 1, "JM data dependency ABI");
+_Static_assert(BASE_JD_DEP_TYPE_ORDER == 2, "JM order dependency ABI");
+_Static_assert(BASE_JD_REQ_DEP == 0, "JM dependency atom ABI");
+_Static_assert(BASE_JD_REQ_SOFT_JOB == 512, "JM soft job ABI");
+_Static_assert(BASE_JD_REQ_SOFT_FENCE_TRIGGER == 514,
+               "JM fence trigger ABI");
+_Static_assert(BASE_JD_REQ_SOFT_FENCE_WAIT == 515, "JM fence wait ABI");
+_Static_assert(BASE_JD_REQ_EVENT_ONLY_ON_FAILURE == 4096,
+               "JM event suppression ABI");
+_Static_assert(BASE_JD_EVENT_DONE == 1, "JM done event ABI");
 
 /*
  * Dumps the first bytes of the tiler heap so a caller can diff the contents
@@ -305,26 +347,11 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
  * (work does not wait for imported sync_files), PANVK_KBASE_CTRL_EXPORT_EARLY=1
  * (an export claims the work is done: -1, without waiting). */
 #define PANVK_KBASE_MAX_CHAIN 120
-#define PANVK_KBASE_ATOM_STRIDE 64 /* public base_jd_atom v3; biblioklept */
+#define PANVK_KBASE_ATOM_STRIDE sizeof(base_jd_atom)
 /* The job atoms of one submission, plus a FENCE_WAIT and a DEP atom. */
 #define PANVK_KBASE_MAX_SUB_ATOMS (PANVK_KBASE_MAX_CHAIN + 2)
 /* Each submission in flight holds at least one of the 255 atom numbers. */
 #define PANVK_KBASE_MAX_SUBS 255
-/* From the kbase JM UAPI, mali_base_jm_kernel.h (r54p1). */
-#define BASE_JD_DEP_TYPE_DATA (1U << 0)
-#define BASE_JD_DEP_TYPE_ORDER (1U << 1)
-#define BASE_JD_REQ_DEP 0U
-#define BASE_JD_REQ_SOFT_JOB (1U << 9)
-#define BASE_JD_REQ_SOFT_FENCE_TRIGGER (BASE_JD_REQ_SOFT_JOB | 0x2)
-#define BASE_JD_REQ_SOFT_FENCE_WAIT (BASE_JD_REQ_SOFT_JOB | 0x3)
-#define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE (1U << 12)
-#define BASE_JD_EVENT_DONE 0x1
-
-/* struct base_fence, mali_base_kernel.h */
-struct panvk_kbase_base_fence {
-   int fd;
-   int stream_fd;
-};
 
 struct panvk_kbase_job {
    uint64_t jc;
@@ -400,17 +427,18 @@ panvk_kbase_chain_enabled(void)
 }
 
 static void
-panvk_kbase_atom(uint8_t *a, uint8_t num, uint64_t jc, uint32_t core_req,
+panvk_kbase_atom(base_jd_atom *a, uint8_t num, uint64_t jc, uint32_t core_req,
                  uint8_t dep0, uint8_t type0, uint8_t dep1, uint8_t type1)
 {
-   memset(a, 0, PANVK_KBASE_ATOM_STRIDE);
-   memcpy(a + 8, &jc, 8);
-   a[44] = dep0;                /* pre_dep[0].atom_id */
-   a[45] = dep0 ? type0 : 0;    /* pre_dep[0].dependency_type */
-   a[46] = dep1;                /* pre_dep[1] */
-   a[47] = dep1 ? type1 : 0;
-   a[48] = num;                 /* atom_number */
-   memcpy(a + 52, &core_req, 4);
+   *a = (base_jd_atom){
+      .jc = jc,
+      .pre_dep = {
+         {.atom_id = dep0, .dependency_type = dep0 ? type0 : 0},
+         {.atom_id = dep1, .dependency_type = dep1 ? type1 : 0},
+      },
+      .atom_number = num,
+      .core_req = core_req,
+   };
 }
 
 static void
@@ -442,7 +470,7 @@ panvk_kbase_find_sub(struct panvk_kbase_jm *k, uint8_t atom)
 /* Caller holds k->mtx. */
 static void
 panvk_kbase_handle_event(struct panvk_kbase_jm *k,
-                         const struct panvk_kbase_event_v2 *ev)
+                         const struct base_jd_event_v2 *ev)
 {
    const uint8_t atom = ev->atom_number;
 
@@ -517,7 +545,7 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
 
    /* poll() said there are events and nobody else reads: read() returns
     * every pending event that fits without blocking. */
-   struct panvk_kbase_event_v2 ev[32];
+   struct base_jd_event_v2 ev[32];
    ssize_t len = 0;
    bool failed = ret < 0;
    if (ret > 0 && (pfd.revents & POLLIN)) {
@@ -603,15 +631,17 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
       k->count
          ? k->subs[(k->head + k->count - 1) % PANVK_KBASE_MAX_SUBS].last
          : 0;
-   uint8_t atoms[PANVK_KBASE_MAX_SUB_ATOMS][PANVK_KBASE_ATOM_STRIDE];
-   struct panvk_kbase_base_fence wait_fence = {.fd = wait_fd, .stream_fd = -1};
+   base_jd_atom atoms[PANVK_KBASE_MAX_SUB_ATOMS];
+   struct base_fence wait_fence = {
+      .basep = {.fd = wait_fd, .stream_fd = -1},
+   };
    uint8_t wait_atom = 0;
    unsigned a = 0;
 
    if (wait_fd >= 0) {
       k->stats.fence_wait_atoms++;
       wait_atom = nums[a];
-      panvk_kbase_atom(atoms[a], nums[a], (uintptr_t)&wait_fence,
+      panvk_kbase_atom(&atoms[a], nums[a], (uintptr_t)&wait_fence,
                        BASE_JD_REQ_SOFT_FENCE_WAIT |
                           BASE_JD_REQ_EVENT_ONLY_ON_FAILURE,
                        0, 0, 0, 0);
@@ -626,18 +656,19 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
       if (i + 1 < n)
          core_req |= BASE_JD_REQ_EVENT_ONLY_ON_FAILURE;
       if (i == 0)
-         panvk_kbase_atom(atoms[a], nums[a], jobs[i].jc, core_req, prev,
+         panvk_kbase_atom(&atoms[a], nums[a], jobs[i].jc, core_req, prev,
                           BASE_JD_DEP_TYPE_ORDER,
                           k->ctrl_no_fence_wait_dep ? 0 : wait_atom,
                           BASE_JD_DEP_TYPE_ORDER);
       else
-         panvk_kbase_atom(atoms[a], nums[a], jobs[i].jc, core_req, nums[a - 1],
+         panvk_kbase_atom(&atoms[a], nums[a], jobs[i].jc, core_req,
+                          nums[a - 1],
                           BASE_JD_DEP_TYPE_DATA, 0, 0);
    }
 
    if (!n) {
       /* Only a wait: a dependency-only atom completes the submission. */
-      panvk_kbase_atom(atoms[a], nums[a], 0, BASE_JD_REQ_DEP, prev,
+      panvk_kbase_atom(&atoms[a], nums[a], 0, BASE_JD_REQ_DEP, prev,
                        BASE_JD_DEP_TYPE_ORDER, wait_atom,
                        BASE_JD_DEP_TYPE_ORDER);
       a++;
@@ -800,13 +831,13 @@ panvk_kbase_sync_export_cb(
             continue;
          }
 
-         struct panvk_kbase_base_fence fence = {.fd = -1, .stream_fd = -1};
-         uint8_t atom[PANVK_KBASE_ATOM_STRIDE];
-         panvk_kbase_atom(atom, num, (uintptr_t)&fence,
+         struct base_fence fence = {.basep = {.fd = -1, .stream_fd = -1}};
+         base_jd_atom atom;
+         panvk_kbase_atom(&atom, num, (uintptr_t)&fence,
                           BASE_JD_REQ_SOFT_FENCE_TRIGGER, sub->last,
                           BASE_JD_DEP_TYPE_DATA, 0, 0);
          struct kbase_ioctl_job_submit submit = {
-            .addr = (uint64_t)(uintptr_t)atom,
+            .addr = (uint64_t)(uintptr_t)&atom,
             .nr_atoms = 1,
             .stride = PANVK_KBASE_ATOM_STRIDE,
          };
@@ -818,13 +849,13 @@ panvk_kbase_sync_export_cb(
             result = VK_ERROR_DEVICE_LOST;
             break;
          }
-         if (fence.fd < 0) {
+         if (fence.basep.fd < 0) {
             /* The atom completes (and frees its number) with an error. */
             mesa_loge("panvk: kbase FENCE_TRIGGER gave no fd");
             cpu_wait = true;
             break;
          }
-         sub->fence_fd = fence.fd;
+         sub->fence_fd = fence.basep.fd;
          k->stats.export_new++;
       } else {
          k->stats.export_dup++;

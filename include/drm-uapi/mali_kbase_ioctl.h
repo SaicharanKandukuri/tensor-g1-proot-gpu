@@ -6,8 +6,9 @@
  * Assembled from the Arm Bifrost/Valhall kbase uAPI headers
  * (mali_kbase_ioctl.h, mali_kbase_jm_ioctl.h, mali_kbase_csf_ioctl.h,
  * mali_base_kernel.h, mali_kbase_gpuprops.h), matching kernel driver
- * releases r32p0–r44p0.  Values cross-checked against the panfork
- * userspace driver and the Rockchip/Google shipping kernel sources.
+ * releases r32p0–r44p0 for the common and CSF coverage.  The JM subset used
+ * here is checked against Google GPU r49p0 (UAPI 11.45) and r50p0 (UAPI
+ * 11.47), which bracket the target's 11.46 runtime (biblioklept ABI audit).
  *
  * Note: the kbase driver comes in two flavours with partially different
  * ioctl numbering:
@@ -66,6 +67,55 @@ struct kbase_ioctl_job_submit {
 };
 #define KBASE_IOCTL_JOB_SUBMIT \
    _IOW(KBASE_IOCTL_TYPE, 2, struct kbase_ioctl_job_submit)
+
+struct base_jd_udata {
+   __u64 blob[2];
+};
+
+typedef __u8 base_atom_id;
+typedef __u8 base_jd_dep_type;
+typedef __u8 base_jd_prio;
+typedef __u32 base_jd_core_req;
+
+#define BASE_JD_DEP_TYPE_DATA    (1U << 0)
+#define BASE_JD_DEP_TYPE_ORDER   (1U << 1)
+
+#define BASE_JD_REQ_DEP                   ((base_jd_core_req)0)
+#define BASE_JD_REQ_SOFT_JOB              ((base_jd_core_req)1 << 9)
+#define BASE_JD_REQ_SOFT_FENCE_TRIGGER    (BASE_JD_REQ_SOFT_JOB | 0x2)
+#define BASE_JD_REQ_SOFT_FENCE_WAIT       (BASE_JD_REQ_SOFT_JOB | 0x3)
+#define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE ((base_jd_core_req)1 << 12)
+
+#define BASE_JD_EVENT_DONE 0x01
+
+struct base_dependency {
+   base_atom_id atom_id;
+   base_jd_dep_type dependency_type;
+};
+
+typedef struct base_jd_atom {
+   __u64 seq_nr;
+   __u64 jc;
+   struct base_jd_udata udata;
+   __u64 extres_list;
+   __u16 nr_extres;
+   __u8 jit_id[2];
+   struct base_dependency pre_dep[2];
+   base_atom_id atom_number;
+   base_jd_prio prio;
+   __u8 device_nr;
+   __u8 jobslot;
+   base_jd_core_req core_req;
+   __u8 renderpass_id;
+   __u8 padding[7];
+} base_jd_atom;
+
+struct base_jd_event_v2 {
+   __u32 event_code;
+   base_atom_id atom_number;
+   __u8 padding[3];
+   struct base_jd_udata udata;
+};
 
 /* -----------------------------------------------------------------------
  * Query GPU properties.
