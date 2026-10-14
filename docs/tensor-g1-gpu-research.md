@@ -82,7 +82,7 @@ and Arm's public
 ## Validation ledger
 
 Probe source:
-[`RandomCoderOrg/AdrenoToolsTest` commit `26baeae`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/26baeaee27d774183ea003437239ded11f737447).
+[`RandomCoderOrg/AdrenoToolsTest` commit `8418775`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/841877521a8dea463f6eac1b6f22dcab1368cb2b).
 
 | Capability | Result | Evidence |
 |---|---|---|
@@ -95,8 +95,10 @@ Probe source:
 | Compute-to-host visibility | Pass | Compute-to-host buffer barrier followed by invalidate |
 | Optimal RGBA8 image transfer | Pass | 31x29x2, row length 32, image height 30; exact 7,680-byte hash `a33ce690b1b676d8` matches stock |
 | Nearest fragment texture sampling | Pass | Source layer 1 to 31x29 output; padded readback hash `4eb3b8d769b7221b` matches stock |
+| Indexed drawing | Pass | Indexed draw hash `ad3634ff7218d241` matches stock |
+| Additive blending | Pass | Additive blend hash `fc279fbf3be0e4d0` matches stock |
+| Depth testing | Pass | Depth-test hash `42cffa14ad89a89f` matches stock |
 | Android triangle presentation | Pass | Four-image swapchain and first presented frame observed |
-| Depth, blending, and indexed drawing | Unknown | Not yet isolated |
 | Vulkan conformance | Unknown | Focused dEQP coverage has not run on this branch |
 | Performance and power behavior | Unknown | Correctness gates take priority |
 
@@ -109,8 +111,15 @@ full 7,680-byte layout. Texture sampling preserved its padded readback and
 first frame presented, and captured fault scans were clean. Truncated launches
 that were stopped while copying the 126 MiB test ICD are not counted.
 
-**Observed:** PanVK did not diverge from the stock driver in either image probe,
-so no driver patch was needed for this checkpoint.
+**Observed:** indexed drawing, additive blending, and depth testing matched the
+stock driver on three of three cold executions on
+`google/bluejay/bluejay:17/CP3A.260905.009/16091614:user/release-keys` using the
+driver digest in the target snapshot. Prior hashes were unchanged, the probe
+reported ready and presented its first frame in every run, and captured fault
+scans were clean.
+
+**Observed:** PanVK did not diverge from the stock driver in the image or draw-
+state probes, so no driver patch was needed for these checkpoints.
 
 The cache operations follow the requirements in the
 [Vulkan specification](https://registry.khronos.org/vulkan/specs/latest-ratified/pdf/vkspec.pdf):
@@ -119,11 +128,10 @@ writes are invalidated before host comparison.
 
 ## Next probes
 
-1. Isolate depth testing, blending, and indexed drawing.
-2. Stress Android surface recreation and swapchain lifecycle independently of
+1. Stress Android surface recreation and swapchain lifecycle independently of
    shader correctness.
-3. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
-4. Add performance measurements only after the corresponding correctness gate
+2. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
+3. Add performance measurements only after the corresponding correctness gate
    is stable.
 
 Every failed probe should first identify the boundary that diverged from stock.
