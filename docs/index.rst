@@ -87,6 +87,7 @@ Linux, FreeBSD, and other operating systems.
    drivers/llvmpipe
    drivers/nvk
    panvk-kbase
+   tensor-g1-gpu-research
    drivers/panfrost
    drivers/powervr
    drivers/radv
