@@ -82,7 +82,7 @@ and Arm's public
 ## Validation ledger
 
 Probe source:
-[`RandomCoderOrg/AdrenoToolsTest` commit `94ac334`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/94ac334f8210207d8853985ee05ca1674a0b714e).
+[`RandomCoderOrg/AdrenoToolsTest` commit `26baeae`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/26baeaee27d774183ea003437239ded11f737447).
 
 | Capability | Result | Evidence |
 |---|---|---|
@@ -93,20 +93,21 @@ Probe source:
 | Compute pipeline creation | Pass | Vulkan 1.0 compute pipeline with one storage buffer |
 | Compute dispatch | Pass | 1,024 invocations; hash `c3e210fc6f652c42` matches stock |
 | Compute-to-host visibility | Pass | Compute-to-host buffer barrier followed by invalidate |
-| Optimal RGBA8 image transfer | Pass | 8x8 buffer-image-buffer copy; hash `9327a8163633c634` matches stock |
-| Nearest fragment texture sampling | Pass | 8x8 offscreen render and readback; hash `9327a8163633c634` matches stock |
+| Optimal RGBA8 image transfer | Pass | 31x29x2, row length 32, image height 30; exact 7,680-byte hash `a33ce690b1b676d8` matches stock |
+| Nearest fragment texture sampling | Pass | Source layer 1 to 31x29 output; padded readback hash `4eb3b8d769b7221b` matches stock |
 | Android triangle presentation | Pass | Four-image swapchain and first presented frame observed |
 | Depth, blending, and indexed drawing | Unknown | Not yet isolated |
 | Vulkan conformance | Unknown | Focused dEQP coverage has not run on this branch |
 | Performance and power behavior | Unknown | Correctness gates take priority |
 
-**Observed:** the buffer, compute, image-transfer, and texture-sampling probes
-passed on three completed cold executions using the device build and driver
-digest in the target snapshot. Image transfer replaced the preceding compute
-output; texture sampling replaced a `0x5a` readback sentinel. Both matched the
-same orientation-sensitive 0/255 pattern. Captured fault scans were clean.
-Truncated launches that were stopped while copying the 126 MiB test ICD are not
-counted.
+**Observed:** the buffer, compute, odd-layout image-transfer, and layer-1
+texture-sampling probes passed on three completed cold executions using the
+device build and driver digest in the target snapshot. Image transfer used
+distinct `0xa6` upload and `0x5a` readback padding sentinels and compared the
+full 7,680-byte layout. Texture sampling preserved its padded readback and
+`0x3c` guard region. The legacy buffer and compute hashes were unchanged, the
+first frame presented, and captured fault scans were clean. Truncated launches
+that were stopped while copying the 126 MiB test ICD are not counted.
 
 **Observed:** PanVK did not diverge from the stock driver in either image probe,
 so no driver patch was needed for this checkpoint.
@@ -118,13 +119,11 @@ writes are invalidated before host comparison.
 
 ## Next probes
 
-1. Repeat image transfer and sampling with an odd extent, explicit row pitch,
-   and a substantially larger image.
-2. Isolate depth testing, blending, and indexed drawing.
-3. Stress Android surface recreation and swapchain lifecycle independently of
+1. Isolate depth testing, blending, and indexed drawing.
+2. Stress Android surface recreation and swapchain lifecycle independently of
    shader correctness.
-4. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
-5. Add performance measurements only after the corresponding correctness gate
+3. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
+4. Add performance measurements only after the corresponding correctness gate
    is stable.
 
 Every failed probe should first identify the boundary that diverged from stock.
