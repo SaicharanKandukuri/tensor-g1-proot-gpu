@@ -490,13 +490,17 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
    if (!sub) {
       mesa_loge("panvk: kbase event 0x%x for unknown atom %u", ev->event_code,
                 atom);
+      k->lost = true;
       return;
    }
 
-   if (ev->event_code != BASE_JD_EVENT_DONE)
+   if (ev->event_code != BASE_JD_EVENT_DONE) {
       mesa_loge("panvk: kbase atom %u of submission %" PRIu64
                 " failed: event 0x%x",
                 atom, sub->seqno, ev->event_code);
+      k->lost = true;
+      return;
+   }
    if (atom == sub->last)
       sub->done = true;
 
@@ -551,6 +555,11 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    if (ret > 0 && (pfd.revents & POLLIN)) {
       len = read(k->fd, ev, sizeof(ev));
       failed = len <= 0;
+      if (len > 0 && len % sizeof(ev[0])) {
+         errno = EPROTO;
+         len = 0;
+         failed = true;
+      }
    } else if (ret > 0) {
       failed = true; /* POLLERR / POLLHUP / POLLNVAL */
    }
@@ -558,7 +567,7 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
       mesa_loge("panvk: kbase event poll/read failed: %s", strerror(errno));
 
    mtx_lock(&k->mtx);
-   for (unsigned i = 0; len > 0 && i < len / sizeof(ev[0]); i++)
+   for (unsigned i = 0; len > 0 && !k->lost && i < len / sizeof(ev[0]); i++)
       panvk_kbase_handle_event(k, &ev[i]);
    if (failed)
       k->lost = true;
@@ -574,6 +583,8 @@ panvk_kbase_alloc_atoms(struct panvk_kbase_jm *k, unsigned n, uint8_t *nums,
                         enum panvk_kbase_atom_use use)
 {
    assert(n > 0 && n < 256);
+   if (k->lost)
+      return VK_ERROR_DEVICE_LOST;
    if (k->nr_free < n)
       k->stats.alloc_pressure_waits++;
    while (k->nr_free < n) {
@@ -582,6 +593,8 @@ panvk_kbase_alloc_atoms(struct panvk_kbase_jm *k, unsigned n, uint8_t *nums,
       k->stats.alloc_pressure_iterations++;
       panvk_kbase_progress_locked(k, OS_TIMEOUT_INFINITE);
    }
+   if (k->lost)
+      return VK_ERROR_DEVICE_LOST;
 
    for (unsigned i = 0; i < n; i++) {
       while (k->atom_use[k->cursor] != PANVK_KBASE_ATOM_FREE) {
@@ -614,6 +627,9 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
                           const struct panvk_kbase_job *jobs, unsigned n,
                           int wait_fd, uint64_t *seqno)
 {
+   if (k->lost)
+      return VK_ERROR_DEVICE_LOST;
+
    if (!n && wait_fd < 0) {
       *seqno = k->last_seqno;
       return VK_SUCCESS;
@@ -711,6 +727,8 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
    VkResult result = VK_SUCCESS;
 
    mtx_lock(&k->mtx);
+   if (k->lost)
+      result = VK_ERROR_DEVICE_LOST;
    while (k->completed_seqno < seqno) {
       if (k->lost) {
          result = VK_ERROR_DEVICE_LOST;
@@ -722,6 +740,8 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
          break;
       }
    }
+   if (k->lost)
+      result = VK_ERROR_DEVICE_LOST;
    mtx_unlock(&k->mtx);
    return result;
 }
@@ -809,10 +829,15 @@ panvk_kbase_sync_export_cb(
    bool cpu_wait = k->cpu_fence_export;
 
    *sync_file = -1;
-   if (k->ctrl_export_early)
-      return VK_SUCCESS;
-
    mtx_lock(&k->mtx);
+   if (k->lost) {
+      mtx_unlock(&k->mtx);
+      return VK_ERROR_DEVICE_LOST;
+   }
+   if (k->ctrl_export_early) {
+      mtx_unlock(&k->mtx);
+      return VK_SUCCESS;
+   }
    while (!cpu_wait && k->completed_seqno < seqno) {
       struct panvk_kbase_sub *sub =
          &k->subs[(k->head + (seqno - k->subs[k->head].seqno)) %
@@ -844,6 +869,8 @@ panvk_kbase_sync_export_cb(
          if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
             mesa_loge("panvk: kbase FENCE_TRIGGER submit failed: %s",
                       strerror(errno));
+            if (fence.basep.fd >= 0)
+               close(fence.basep.fd);
             k->lost = true;
             u_cnd_monotonic_broadcast(&k->cnd);
             result = VK_ERROR_DEVICE_LOST;
@@ -888,13 +915,12 @@ panvk_kbase_chain_has_batch(const struct panvk_kbase_chain *c,
    return false;
 }
 
-static void
+static VkResult
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
                          struct panvk_batch *batch, uint32_t *bos,
                          unsigned nr_bos, uint32_t *in_fences,
-                         unsigned nr_in_fences,
-                         struct panvk_kbase_chain *chain)
+                         unsigned nr_in_fences, struct panvk_kbase_chain *chain)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
@@ -910,12 +936,12 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (chain && panvk_kbase_chain_has_batch(chain, batch)) {
          result = panvk_kbase_flush(k, chain, false, false, NULL);
          if (result != VK_SUCCESS)
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            return result;
       }
       result = panvk_kbase_wait_seqno(k, batch->kbase_seqno,
                                       OS_TIMEOUT_INFINITE);
       if (result != VK_SUCCESS)
-         mesa_loge("panvk: wait for a re-issued batch failed: %d", result);
+         return result;
 
       util_dynarray_foreach(&batch->jobs, void *, job)
          memset((*job), 0, 4 * 4);
@@ -945,7 +971,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
           chain->nr_batches + 1 > PANVK_KBASE_MAX_CHAIN) {
          result = panvk_kbase_flush(k, chain, false, true, NULL);
          if (result != VK_SUCCESS)
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            return result;
       }
       if (batch->vtc_jc.first_job)
          chain->jobs[chain->nr_jobs++] = (struct panvk_kbase_job){
@@ -955,7 +981,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
             .jc = batch->frag_jc.first_job, .core_req = 0x01};
       chain->batches[chain->nr_batches++] = batch;
       batch->issued = true;
-      return;
+      return VK_SUCCESS;
    }
 
    /* SKIP: dump sebelum submit dipastikan SIGSEGV karena ALLOC_ON_FAULT (commit_pages=0), nggak informatif */
@@ -966,6 +992,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (ret)
          mesa_loge("panvk: v9 vtc_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
+      if (result != VK_SUCCESS)
+         return result;
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] vtc_jc ret=%d\n", ret);
@@ -994,6 +1022,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (ret)
          mesa_loge("panvk: v9 frag_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
+      if (result != VK_SUCCESS)
+         return result;
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] frag_jc ret=%d\n", ret);
@@ -1020,6 +1050,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       pandecode_next_frame(dev->debug.decode_ctx);
 
    batch->issued = true;
+   return VK_SUCCESS;
 }
 
 static void
@@ -1170,6 +1201,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       if (wr != VK_SUCCESS) {
          if (wait_fd >= 0)
             close(wait_fd);
+         if (wr == VK_ERROR_DEVICE_LOST)
+            return vk_device_set_lost(&dev->vk, "kbase sync wait failed");
          return wr;
       }
    }
@@ -1242,14 +1275,16 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          const bool has_event_ops = max_wait_event_syncobjs > 0;
          if (chain && has_event_ops &&
              (result = panvk_kbase_flush(k, chain, false, false, NULL)))
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            goto fail;
 
-         panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
-                                  nr_in_fences, chain);
+         result = panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos,
+                                           in_fences, nr_in_fences, chain);
+         if (result != VK_SUCCESS)
+            goto fail;
 
          if (chain && has_event_ops &&
              (result = panvk_kbase_flush(k, chain, true, false, NULL)))
-            mesa_loge("panvk: v9 chained submit failed: %d", result);
+            goto fail;
 
          panvk_signal_event_syncobjs(queue, batch);
       }
@@ -1260,8 +1295,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    if (chain) {
       result = panvk_kbase_flush(k, chain, wait_submit, false, &seqno);
       if (result != VK_SUCCESS)
-         return vk_device_set_lost(&dev->vk, "kbase submission failed: %d",
-                                   result);
+         goto fail;
    } else {
       mtx_lock(&k->mtx);
       seqno = k->last_seqno;
@@ -1281,8 +1315,10 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          if (wait_submit || !seqno) {
             VkResult sr = vk_sync_signal(&dev->vk, submit->signals[i].sync,
                                          submit->signals[i].signal_value);
-            if (sr != VK_SUCCESS)
-               return sr;
+            if (sr != VK_SUCCESS) {
+               result = sr;
+               goto fail;
+            }
          } else {
             panvk_kbase_sync_set_pending(submit->signals[i].sync, k,
                                          panvk_kbase_sync_wait_cb,
@@ -1292,6 +1328,18 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    }
 
    return VK_SUCCESS;
+
+fail:
+   if (chain) {
+      if (chain->wait_fd >= 0)
+         close(chain->wait_fd);
+      chain->wait_fd = -1;
+      chain->nr_jobs = 0;
+      chain->nr_batches = 0;
+   }
+   if (result == VK_ERROR_DEVICE_LOST)
+      return vk_device_set_lost(&dev->vk, "kbase submission failed");
+   return result;
 }
 
 static void
@@ -1458,6 +1506,19 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
 VkResult
 panvk_per_arch(gpu_queue_check_status)(struct vk_queue *vk_queue)
 {
+   struct panvk_gpu_queue *queue =
+      container_of(vk_queue, struct panvk_gpu_queue, vk);
+   struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
+   struct panvk_kbase_jm *k = queue->kjm;
+
+   mtx_lock(&k->mtx);
+   while (!k->lost && panvk_kbase_progress_locked(k, 0))
+      ;
+   bool lost = k->lost;
+   mtx_unlock(&k->mtx);
+
+   if (lost)
+      return vk_device_set_lost(&dev->vk, "kbase queue lost");
    return VK_SUCCESS;
 }
 
