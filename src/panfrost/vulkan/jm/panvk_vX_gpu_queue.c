@@ -305,7 +305,7 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
  * (work does not wait for imported sync_files), PANVK_KBASE_CTRL_EXPORT_EARLY=1
  * (an export claims the work is done: -1, without waiting). */
 #define PANVK_KBASE_MAX_CHAIN 120
-#define PANVK_KBASE_ATOM_STRIDE 64 /* base_jd_atom_v2 + MTK BM_2 frame_nr */
+#define PANVK_KBASE_ATOM_STRIDE 64 /* public base_jd_atom v3; biblioklept */
 /* The job atoms of one submission, plus a FENCE_WAIT and a DEP atom. */
 #define PANVK_KBASE_MAX_SUB_ATOMS (PANVK_KBASE_MAX_CHAIN + 2)
 /* Each submission in flight holds at least one of the 255 atom numbers. */
@@ -367,6 +367,7 @@ struct panvk_kbase_jm {
    struct panvk_kbase_sub subs[PANVK_KBASE_MAX_SUBS]; /* ring, oldest first */
    unsigned head, count;
    uint8_t atom_use[256];
+   bool atom_seen[256];
    unsigned nr_free, cursor;
    bool lost;
    bool reading; /* a thread is polling/reading the kbase fd */
@@ -374,12 +375,19 @@ struct panvk_kbase_jm {
    struct panvk_kbase_chain chain;
    bool wait_submit, cpu_fence_wait, cpu_fence_export;
    bool ctrl_no_fence_wait_dep, ctrl_export_early;
+   bool trace_limit_pending;
    /* Counted always, printed at destroy with PANVK_KBASE_FENCE_TRACE=1:
     * waits by payload, FENCE_WAIT atoms, exports by outcome. */
    bool trace;
    struct {
       uint64_t wait_none, wait_own, wait_file, wait_cpu, fence_wait_atoms;
       uint64_t export_new, export_dup, export_done, export_cpu;
+      uint64_t atom_allocated, atom_freed, atom_reused, cursor_wraps;
+      uint64_t alloc_pressure_waits, alloc_pressure_iterations, max_live_atoms;
+      uint64_t events, failed_events, retired_submissions;
+      uint64_t chain_flushes, chain_jobs, chain_batches;
+      uint64_t limit_flushes, limit_jobs, limit_batches;
+      uint64_t limit_tail_flushes, limit_tail_jobs, limit_tail_batches;
    } stats;
 };
 
@@ -414,6 +422,7 @@ panvk_kbase_free_atoms(struct panvk_kbase_jm *k, unsigned n,
       k->atom_use[nums[i]] = PANVK_KBASE_ATOM_FREE;
    }
    k->nr_free += n;
+   k->stats.atom_freed += n;
 }
 
 static struct panvk_kbase_sub *
@@ -436,6 +445,10 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
                          const struct panvk_kbase_event_v2 *ev)
 {
    const uint8_t atom = ev->atom_number;
+
+   k->stats.events++;
+   if (ev->event_code != BASE_JD_EVENT_DONE)
+      k->stats.failed_events++;
 
    if (k->atom_use[atom] == PANVK_KBASE_ATOM_AUX) {
       if (ev->event_code != BASE_JD_EVENT_DONE)
@@ -468,6 +481,7 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
       k->completed_seqno = s->seqno;
       k->head = (k->head + 1) % PANVK_KBASE_MAX_SUBS;
       k->count--;
+      k->stats.retired_submissions++;
    }
 }
 
@@ -532,20 +546,35 @@ panvk_kbase_alloc_atoms(struct panvk_kbase_jm *k, unsigned n, uint8_t *nums,
                         enum panvk_kbase_atom_use use)
 {
    assert(n > 0 && n < 256);
+   if (k->nr_free < n)
+      k->stats.alloc_pressure_waits++;
    while (k->nr_free < n) {
       if (k->lost)
          return VK_ERROR_DEVICE_LOST;
+      k->stats.alloc_pressure_iterations++;
       panvk_kbase_progress_locked(k, OS_TIMEOUT_INFINITE);
    }
 
    for (unsigned i = 0; i < n; i++) {
-      while (k->atom_use[k->cursor] != PANVK_KBASE_ATOM_FREE)
-         k->cursor = k->cursor % 255 + 1;
+      while (k->atom_use[k->cursor] != PANVK_KBASE_ATOM_FREE) {
+         if (k->cursor++ == 255) {
+            k->cursor = 1;
+            k->stats.cursor_wraps++;
+         }
+      }
       nums[i] = k->cursor;
       k->atom_use[k->cursor] = use;
-      k->cursor = k->cursor % 255 + 1;
+      if (k->atom_seen[k->cursor])
+         k->stats.atom_reused++;
+      k->atom_seen[k->cursor] = true;
+      if (k->cursor++ == 255) {
+         k->cursor = 1;
+         k->stats.cursor_wraps++;
+      }
    }
    k->nr_free -= n;
+   k->stats.atom_allocated += n;
+   k->stats.max_live_atoms = MAX2(k->stats.max_live_atoms, 255 - k->nr_free);
    return VK_SUCCESS;
 }
 
@@ -669,11 +698,26 @@ panvk_kbase_wait_seqno(struct panvk_kbase_jm *k, uint64_t seqno,
 /* Submit what the chain holds, plus its pending wait, as one submission. */
 static VkResult
 panvk_kbase_flush(struct panvk_kbase_jm *k, struct panvk_kbase_chain *c,
-                  bool wait, uint64_t *out_seqno)
+                  bool wait, bool limit, uint64_t *out_seqno)
 {
    uint64_t seqno = 0;
 
    mtx_lock(&k->mtx);
+   k->stats.chain_flushes++;
+   k->stats.chain_jobs += c->nr_jobs;
+   k->stats.chain_batches += c->nr_batches;
+   if (k->trace && k->trace_limit_pending && !limit) {
+      k->stats.limit_tail_flushes++;
+      k->stats.limit_tail_jobs += c->nr_jobs;
+      k->stats.limit_tail_batches += c->nr_batches;
+      k->trace_limit_pending = false;
+   }
+   if (limit) {
+      k->stats.limit_flushes++;
+      k->stats.limit_jobs += c->nr_jobs;
+      k->stats.limit_batches += c->nr_batches;
+      k->trace_limit_pending = k->trace;
+   }
    VkResult result =
       panvk_kbase_submit_locked(k, c->jobs, c->nr_jobs, c->wait_fd, &seqno);
    mtx_unlock(&k->mtx);
@@ -833,7 +877,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       /* Never rewrite a batch that is still queued in the current chain, or
        * that the GPU may still be running. */
       if (chain && panvk_kbase_chain_has_batch(chain, batch)) {
-         result = panvk_kbase_flush(k, chain, false, NULL);
+         result = panvk_kbase_flush(k, chain, false, false, NULL);
          if (result != VK_SUCCESS)
             mesa_loge("panvk: v9 chained submit failed: %d", result);
       }
@@ -868,7 +912,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    if (chain) {
       if (chain->nr_jobs + 2 > PANVK_KBASE_MAX_CHAIN ||
           chain->nr_batches + 1 > PANVK_KBASE_MAX_CHAIN) {
-         result = panvk_kbase_flush(k, chain, false, NULL);
+         result = panvk_kbase_flush(k, chain, false, true, NULL);
          if (result != VK_SUCCESS)
             mesa_loge("panvk: v9 chained submit failed: %d", result);
       }
@@ -1166,14 +1210,14 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
           * before its sets/resets are applied. */
          const bool has_event_ops = max_wait_event_syncobjs > 0;
          if (chain && has_event_ops &&
-             (result = panvk_kbase_flush(k, chain, false, NULL)))
+             (result = panvk_kbase_flush(k, chain, false, false, NULL)))
             mesa_loge("panvk: v9 chained submit failed: %d", result);
 
          panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
                                   nr_in_fences, chain);
 
          if (chain && has_event_ops &&
-             (result = panvk_kbase_flush(k, chain, true, NULL)))
+             (result = panvk_kbase_flush(k, chain, true, false, NULL)))
             mesa_loge("panvk: v9 chained submit failed: %d", result);
 
          panvk_signal_event_syncobjs(queue, batch);
@@ -1183,7 +1227,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    /* The rest of the chain (or, with no command buffers, only the waits). */
    uint64_t seqno = 0;
    if (chain) {
-      result = panvk_kbase_flush(k, chain, wait_submit, &seqno);
+      result = panvk_kbase_flush(k, chain, wait_submit, false, &seqno);
       if (result != VK_SUCCESS)
          return vk_device_set_lost(&dev->vk, "kbase submission failed: %d",
                                    result);
@@ -1233,6 +1277,24 @@ panvk_kbase_log_stats(struct panvk_kbase_jm *k)
              k->stats.wait_file, k->stats.wait_cpu, k->stats.fence_wait_atoms,
              k->stats.export_new, k->stats.export_dup, k->stats.export_done,
              k->stats.export_cpu);
+   mesa_logi(
+      "panvk: kbase trace atom_allocated=%" PRIu64 " atom_freed=%" PRIu64
+      " atom_reused=%" PRIu64 " cursor_wraps=%" PRIu64
+      " alloc_pressure_waits=%" PRIu64 " alloc_pressure_iterations=%" PRIu64
+      " max_live_atoms=%" PRIu64 " events=%" PRIu64 " failed_events=%" PRIu64
+      " retired_submissions=%" PRIu64 " chain_flushes=%" PRIu64
+      " chain_jobs=%" PRIu64 " chain_batches=%" PRIu64 " limit_flushes=%" PRIu64
+      " limit_jobs=%" PRIu64 " limit_batches=%" PRIu64
+      " limit_tail_flushes=%" PRIu64 " limit_tail_jobs=%" PRIu64
+      " limit_tail_batches=%" PRIu64,
+      k->stats.atom_allocated, k->stats.atom_freed, k->stats.atom_reused,
+      k->stats.cursor_wraps, k->stats.alloc_pressure_waits,
+      k->stats.alloc_pressure_iterations, k->stats.max_live_atoms,
+      k->stats.events, k->stats.failed_events, k->stats.retired_submissions,
+      k->stats.chain_flushes, k->stats.chain_jobs, k->stats.chain_batches,
+      k->stats.limit_flushes, k->stats.limit_jobs, k->stats.limit_batches,
+      k->stats.limit_tail_flushes, k->stats.limit_tail_jobs,
+      k->stats.limit_tail_batches);
    mtx_unlock(&k->mtx);
 }
 
