@@ -34,11 +34,19 @@
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
 
-#ifdef HAVE_PAN_KMOD_KBASE
+#include <errno.h>
+#if defined(HAVE_PAN_KMOD_KBASE) || defined(PANVK_JM_FAULT_INJECTION)
 #include <fcntl.h>
 #endif
 
+#ifdef PANVK_JM_FAULT_INJECTION
+#include <unistd.h>
+#endif
+
 #include "kmod/pan_kmod.h"
+#ifdef PANVK_JM_FAULT_INJECTION
+#include "util/log.h"
+#endif
 #include "util/os_file.h"
 #include "util/u_printf.h"
 #include "pan_props.h"
@@ -548,6 +556,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_finish_dev;
    }
 
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (physical_device->kbase_node_path[0]) {
+      mesa_logi("panvk: jm-lifetime event=CREATE role=logical pid=%ld "
+                "instance=%p physical=%p logical=%p kmod=%p fd=%d path=%s",
+                (long)getpid(), (void *)instance, (void *)physical_device,
+                (void *)device, (void *)device->kmod.dev, device->kmod.dev->fd,
+                physical_device->kbase_node_path);
+   }
+#endif
+
    if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || PANVK_DEBUG(DUMP)) {
       device->debug.decode_ctx = pandecode_create_context(false);
       pandecode_set_disassemble(device->debug.decode_ctx, pan_disassemble);
@@ -769,7 +787,30 @@ err_destroy_kdev:
    if (device->debug.decode_ctx)
       pandecode_destroy_context(device->debug.decode_ctx);
 
-   pan_kmod_dev_destroy(device->kmod.dev);
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (physical_device->kbase_node_path[0]) {
+      void *kmod_ptr = device->kmod.dev;
+      int kmod_fd = device->kmod.dev->fd;
+      mesa_logi("panvk: jm-lifetime event=DESTROY_BEGIN role=logical pid=%ld "
+                "instance=%p physical=%p logical=%p kmod=%p fd=%d path=%s",
+                (long)getpid(), (void *)instance, (void *)physical_device,
+                (void *)device, kmod_ptr, kmod_fd,
+                physical_device->kbase_node_path);
+      pan_kmod_dev_destroy(device->kmod.dev);
+      int fd_check = fcntl(kmod_fd, F_GETFD);
+      int fd_errno = fd_check < 0 ? errno : 0;
+      const char *fd_state = fd_check >= 0       ? "OPEN_OR_REUSED"
+                             : fd_errno == EBADF ? "CLOSED_EBADF"
+                                                 : "ERROR";
+      mesa_logi("panvk: jm-lifetime event=DESTROY_END role=logical pid=%ld "
+                "instance=%p physical=%p logical=%p kmod=%p fd=%d path=%s "
+                "fd_state=%s errno=%d",
+                (long)getpid(), (void *)instance, (void *)physical_device,
+                (void *)device, kmod_ptr, kmod_fd,
+                physical_device->kbase_node_path, fd_state, fd_errno);
+   } else
+#endif
+      pan_kmod_dev_destroy(device->kmod.dev);
 
 err_finish_dev:
    vk_device_finish(&device->vk);
@@ -814,7 +855,34 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    if (device->debug.decode_ctx)
       pandecode_destroy_context(device->debug.decode_ctx);
 
-   pan_kmod_dev_destroy(device->kmod.dev);
+#ifdef PANVK_JM_FAULT_INJECTION
+   struct panvk_physical_device *physical_device =
+      to_panvk_physical_device(device->vk.physical);
+   if (physical_device->kbase_node_path[0]) {
+      struct panvk_instance *instance =
+         to_panvk_instance(physical_device->vk.instance);
+      void *kmod_ptr = device->kmod.dev;
+      int kmod_fd = device->kmod.dev->fd;
+      mesa_logi("panvk: jm-lifetime event=DESTROY_BEGIN role=logical pid=%ld "
+                "instance=%p physical=%p logical=%p kmod=%p fd=%d path=%s",
+                (long)getpid(), (void *)instance, (void *)physical_device,
+                (void *)device, kmod_ptr, kmod_fd,
+                physical_device->kbase_node_path);
+      pan_kmod_dev_destroy(device->kmod.dev);
+      int fd_check = fcntl(kmod_fd, F_GETFD);
+      int fd_errno = fd_check < 0 ? errno : 0;
+      const char *fd_state = fd_check >= 0       ? "OPEN_OR_REUSED"
+                             : fd_errno == EBADF ? "CLOSED_EBADF"
+                                                 : "ERROR";
+      mesa_logi("panvk: jm-lifetime event=DESTROY_END role=logical pid=%ld "
+                "instance=%p physical=%p logical=%p kmod=%p fd=%d path=%s "
+                "fd_state=%s errno=%d",
+                (long)getpid(), (void *)instance, (void *)physical_device,
+                (void *)device, kmod_ptr, kmod_fd,
+                physical_device->kbase_node_path, fd_state, fd_errno);
+   } else
+#endif
+      pan_kmod_dev_destroy(device->kmod.dev);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }

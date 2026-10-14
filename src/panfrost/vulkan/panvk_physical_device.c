@@ -19,6 +19,10 @@
 #include <sys/sysinfo.h>
 #include <fcntl.h>
 
+#ifdef PANVK_JM_FAULT_INJECTION
+#include <unistd.h>
+#endif
+
 #include "util/disk_cache.h"
 #include "util/cnd_monotonic.h"
 #include "util/os_misc.h"
@@ -1110,13 +1114,52 @@ panvk_get_gpu_system_timestamp_period(const struct panvk_physical_device *device
 void
 panvk_physical_device_finish(struct panvk_physical_device *device)
 {
+#ifdef PANVK_JM_FAULT_INJECTION
+   const bool trace_kbase_lifetime = device->kbase_node_path[0] != '\0';
+   void *instance_ptr =
+      device->vk.instance ? to_panvk_instance(device->vk.instance) : NULL;
+   void *physical_ptr = device;
+   void *kmod_ptr = device->kmod.dev;
+   int kmod_fd = trace_kbase_lifetime ? device->kmod.dev->fd : -1;
+
+   if (trace_kbase_lifetime) {
+      mesa_logi("panvk: jm-lifetime event=DESTROY_BEGIN role=physical "
+                "pid=%ld instance=%p physical=%p kmod=%p fd=%d path=%s",
+                (long)getpid(), instance_ptr, physical_ptr, kmod_ptr, kmod_fd,
+                device->kbase_node_path);
+   }
+#endif
+
    panvk_wsi_finish(device);
 
    free_disk_cache(device);
 
    pan_kmod_dev_destroy(device->kmod.dev);
 
+#ifdef PANVK_JM_FAULT_INJECTION
+   int fd_check = -1;
+   int fd_errno = 0;
+   const char *fd_state = "ERROR";
+   if (trace_kbase_lifetime) {
+      fd_check = fcntl(kmod_fd, F_GETFD);
+      fd_errno = fd_check < 0 ? errno : 0;
+      fd_state = fd_check >= 0       ? "OPEN_OR_REUSED"
+                 : fd_errno == EBADF ? "CLOSED_EBADF"
+                                     : "ERROR";
+   }
+#endif
+
    vk_physical_device_finish(&device->vk);
+
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (trace_kbase_lifetime) {
+      mesa_logi("panvk: jm-lifetime event=DESTROY_END role=physical pid=%ld "
+                "instance=%p physical=%p kmod=%p fd=%d path=%s "
+                "fd_state=%s errno=%d",
+                (long)getpid(), instance_ptr, physical_ptr, kmod_ptr, kmod_fd,
+                device->kbase_node_path, fd_state, fd_errno);
+   }
+#endif
 }
 
 /* Resolve the pan_model for a probed device.  GPUs missing from the model
@@ -1289,6 +1332,13 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+#ifdef PANVK_JM_FAULT_INJECTION
+   mesa_logi("panvk: jm-lifetime event=CREATE role=physical pid=%ld "
+             "instance=%p physical=%p kmod=%p fd=%d path=%s",
+             (long)getpid(), (void *)instance, (void *)device,
+             (void *)device->kmod.dev, device->kmod.dev->fd, path);
+#endif
+
    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
 
    bool unknown_gpu;
@@ -1417,7 +1467,29 @@ fail_kbase:
    if (device->vk.instance)
       vk_physical_device_finish(&device->vk);
 
+#ifdef PANVK_JM_FAULT_INJECTION
+   void *kmod_ptr = device->kmod.dev;
+   int kmod_fd = device->kmod.dev->fd;
+   mesa_logi("panvk: jm-lifetime event=DESTROY_BEGIN role=physical pid=%ld "
+             "instance=%p physical=%p kmod=%p fd=%d path=%s",
+             (long)getpid(), (void *)instance, (void *)device, kmod_ptr,
+             kmod_fd, path);
+#endif
+
    pan_kmod_dev_destroy(device->kmod.dev);
+
+#ifdef PANVK_JM_FAULT_INJECTION
+   int fd_check = fcntl(kmod_fd, F_GETFD);
+   int fd_errno = fd_check < 0 ? errno : 0;
+   const char *fd_state = fd_check >= 0       ? "OPEN_OR_REUSED"
+                          : fd_errno == EBADF ? "CLOSED_EBADF"
+                                              : "ERROR";
+   mesa_logi("panvk: jm-lifetime event=DESTROY_END role=physical pid=%ld "
+             "instance=%p physical=%p kmod=%p fd=%d path=%s "
+             "fd_state=%s errno=%d",
+             (long)getpid(), (void *)instance, (void *)device, kmod_ptr,
+             kmod_fd, path, fd_state, fd_errno);
+#endif
 
    return result;
 }
