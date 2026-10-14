@@ -82,7 +82,7 @@ and Arm's public
 ## Validation ledger
 
 Probe source:
-[`RandomCoderOrg/AdrenoToolsTest` commit `7106c2e`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/7106c2e0f5dcdbb049ec0e0e0d5a0c2e1ce77145).
+[`RandomCoderOrg/AdrenoToolsTest` commit `94ac334`](https://github.com/RandomCoderOrg/AdrenoToolsTest/commit/94ac334f8210207d8853985ee05ca1674a0b714e).
 
 | Capability | Result | Evidence |
 |---|---|---|
@@ -93,15 +93,23 @@ Probe source:
 | Compute pipeline creation | Pass | Vulkan 1.0 compute pipeline with one storage buffer |
 | Compute dispatch | Pass | 1,024 invocations; hash `c3e210fc6f652c42` matches stock |
 | Compute-to-host visibility | Pass | Compute-to-host buffer barrier followed by invalidate |
+| Optimal RGBA8 image transfer | Pass | 8x8 buffer-image-buffer copy; hash `9327a8163633c634` matches stock |
+| Nearest fragment texture sampling | Pass | 8x8 offscreen render and readback; hash `9327a8163633c634` matches stock |
 | Android triangle presentation | Pass | Four-image swapchain and first presented frame observed |
-| Sampled images and layout transitions | Unknown | Next deterministic probe |
 | Depth, blending, and indexed drawing | Unknown | Not yet isolated |
 | Vulkan conformance | Unknown | Focused dEQP coverage has not run on this branch |
 | Performance and power behavior | Unknown | Correctness gates take priority |
 
-The transfer and compute results passed on three completed cold executions.
+**Observed:** the buffer, compute, image-transfer, and texture-sampling probes
+passed on three completed cold executions using the device build and driver
+digest in the target snapshot. Image transfer replaced the preceding compute
+output; texture sampling replaced a `0x5a` readback sentinel. Both matched the
+same orientation-sensitive 0/255 pattern. Captured fault scans were clean.
 Truncated launches that were stopped while copying the 126 MiB test ICD are not
 counted.
+
+**Observed:** PanVK did not diverge from the stock driver in either image probe,
+so no driver patch was needed for this checkpoint.
 
 The cache operations follow the requirements in the
 [Vulkan specification](https://registry.khronos.org/vulkan/specs/latest-ratified/pdf/vkspec.pdf):
@@ -110,9 +118,9 @@ writes are invalidated before host comparison.
 
 ## Next probes
 
-1. Upload a deterministic texture, sample it, render offscreen, and read it
-   back.
-2. Isolate depth testing, blending, indexed drawing, and image transitions.
+1. Repeat image transfer and sampling with an odd extent, explicit row pitch,
+   and a substantially larger image.
+2. Isolate depth testing, blending, and indexed drawing.
 3. Stress Android surface recreation and swapchain lifecycle independently of
    shader correctness.
 4. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
