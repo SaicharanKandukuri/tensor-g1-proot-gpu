@@ -1141,6 +1141,20 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       return NULL;
    }
 
+   const long page_size = sysconf(_SC_PAGESIZE);
+   if (page_size <= 0) {
+      mesa_loge("kbase: failed to query the system page size");
+      errno = EIO;
+      return NULL;
+   }
+
+   if (page_size != 4096) {
+      mesa_loge("kbase: system page size %ld is unsupported (need 4096)",
+                page_size);
+      errno = ENOTSUP;
+      return NULL;
+   }
+
    mesa_logd("kbase: %s driver, uAPI version %d.%d",
              is_csf ? "CSF" : "JM", ver.major, ver.minor);
 
