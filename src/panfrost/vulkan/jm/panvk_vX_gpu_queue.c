@@ -32,6 +32,11 @@
 #include "drm-uapi/mali_kbase_ioctl.h"
 #include <fcntl.h>
 #include <inttypes.h>
+#ifdef PANVK_JM_FAULT_INJECTION
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#endif
 #include <poll.h>
 #include <stddef.h>
 #include <sys/mman.h>
@@ -382,6 +387,128 @@ enum panvk_kbase_atom_use {
    PANVK_KBASE_ATOM_AUX, /* an export's FENCE_TRIGGER, freed by its event */
 };
 
+#ifdef PANVK_JM_FAULT_INJECTION
+enum panvk_jm_fault_mode {
+   PANVK_JM_FAULT_NONE,
+   PANVK_JM_FAULT_SUBMIT_EIO,
+   PANVK_JM_FAULT_PPOLL_EIO,
+   PANVK_JM_FAULT_PPOLL_TIMEOUT,
+   PANVK_JM_FAULT_READ_EIO,
+   PANVK_JM_FAULT_DONE_FAILURE,
+};
+
+struct panvk_jm_fault {
+   enum panvk_jm_fault_mode mode;
+   char run_id[64];
+   unsigned target;
+   atomic_uint remaining;
+   atomic_bool consumed;
+};
+
+static const char *
+panvk_jm_fault_mode_name(enum panvk_jm_fault_mode mode)
+{
+   switch (mode) {
+   case PANVK_JM_FAULT_SUBMIT_EIO:
+      return "submit-eio";
+   case PANVK_JM_FAULT_PPOLL_EIO:
+      return "ppoll-eio";
+   case PANVK_JM_FAULT_PPOLL_TIMEOUT:
+      return "ppoll-timeout";
+   case PANVK_JM_FAULT_READ_EIO:
+      return "read-eio";
+   case PANVK_JM_FAULT_DONE_FAILURE:
+      return "done-failure";
+   default:
+      return "none";
+   }
+}
+
+static enum panvk_jm_fault_mode
+panvk_jm_fault_parse_mode(const char *name, size_t len)
+{
+   static const struct {
+      const char *name;
+      enum panvk_jm_fault_mode mode;
+   } modes[] = {
+      {"submit-eio", PANVK_JM_FAULT_SUBMIT_EIO},
+      {"ppoll-eio", PANVK_JM_FAULT_PPOLL_EIO},
+      {"ppoll-timeout", PANVK_JM_FAULT_PPOLL_TIMEOUT},
+      {"read-eio", PANVK_JM_FAULT_READ_EIO},
+      {"done-failure", PANVK_JM_FAULT_DONE_FAILURE},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(modes); i++) {
+      if (strlen(modes[i].name) == len && !memcmp(name, modes[i].name, len))
+         return modes[i].mode;
+   }
+   return PANVK_JM_FAULT_NONE;
+}
+
+static bool
+panvk_jm_fault_parse(const char *selector, struct panvk_jm_fault *fault)
+{
+   const char *mode_sep = strchr(selector, ':');
+   if (!mode_sep || mode_sep == selector)
+      return false;
+
+   const size_t run_len = mode_sep - selector;
+   if (run_len >= sizeof(fault->run_id))
+      return false;
+   for (size_t i = 0; i < run_len; i++) {
+      const char c = selector[i];
+      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+         return false;
+   }
+
+   const char *count_sep = strchr(mode_sep + 1, ':');
+   const size_t mode_len =
+      count_sep ? (size_t)(count_sep - mode_sep - 1) : strlen(mode_sep + 1);
+   enum panvk_jm_fault_mode mode =
+      panvk_jm_fault_parse_mode(mode_sep + 1, mode_len);
+   if (mode == PANVK_JM_FAULT_NONE)
+      return false;
+
+   unsigned long target = 1;
+   if (count_sep) {
+      if (!count_sep[1])
+         return false;
+      for (const char *c = count_sep + 1; *c; c++) {
+         if (*c < '0' || *c > '9')
+            return false;
+      }
+      char *end = NULL;
+      target = strtoul(count_sep + 1, &end, 10);
+      if (end == count_sep + 1 || *end || !target || target > UINT_MAX)
+         return false;
+   }
+
+   memcpy(fault->run_id, selector, run_len);
+   fault->run_id[run_len] = '\0';
+   fault->mode = mode;
+   fault->target = target;
+   atomic_init(&fault->remaining, target);
+   atomic_init(&fault->consumed, false);
+   return true;
+}
+
+static bool
+panvk_jm_fault_parser_self_test(void)
+{
+   struct panvk_jm_fault fault = {0};
+   return panvk_jm_fault_parse("self:submit-eio:3", &fault) &&
+          fault.mode == PANVK_JM_FAULT_SUBMIT_EIO && fault.target == 3 &&
+          !strcmp(fault.run_id, "self") &&
+          !panvk_jm_fault_parse("self:unknown", &fault) &&
+          !panvk_jm_fault_parse("self:read-eio:0", &fault) &&
+          !panvk_jm_fault_parse("bad\nrun:read-eio", &fault) &&
+          !panvk_jm_fault_parse("bad run:read-eio", &fault) &&
+          !panvk_jm_fault_parse("self:read-eio:+1", &fault) &&
+          !panvk_jm_fault_parse("self:read-eio:-1", &fault);
+}
+#endif
+
 struct panvk_kbase_jm {
    int fd;
    /* Protects everything below, and is held across JOB_SUBMIT so that seqno
@@ -406,6 +533,9 @@ struct panvk_kbase_jm {
    /* Counted always, printed at destroy with PANVK_KBASE_FENCE_TRACE=1:
     * waits by payload, FENCE_WAIT atoms, exports by outcome. */
    bool trace;
+#ifdef PANVK_JM_FAULT_INJECTION
+   struct panvk_jm_fault fault;
+#endif
    struct {
       uint64_t wait_none, wait_own, wait_file, wait_cpu, fence_wait_atoms;
       uint64_t export_new, export_dup, export_done, export_cpu;
@@ -417,6 +547,44 @@ struct panvk_kbase_jm {
       uint64_t limit_tail_flushes, limit_tail_jobs, limit_tail_batches;
    } stats;
 };
+
+#ifdef PANVK_JM_FAULT_INJECTION
+static bool
+panvk_jm_fault_try_consume(struct panvk_kbase_jm *k,
+                           enum panvk_jm_fault_mode mode)
+{
+   if (k->fault.mode != mode)
+      return false;
+
+   unsigned remaining =
+      atomic_load_explicit(&k->fault.remaining, memory_order_relaxed);
+   while (remaining) {
+      if (atomic_compare_exchange_weak_explicit(
+             &k->fault.remaining, &remaining, remaining - 1,
+             memory_order_relaxed, memory_order_relaxed)) {
+         if (remaining != 1)
+            return false;
+         atomic_store_explicit(&k->fault.consumed, true, memory_order_release);
+         return true;
+      }
+   }
+   return false;
+}
+
+static void
+panvk_jm_fault_log(struct panvk_kbase_jm *k, const char *state, int error)
+{
+   mesa_logi("panvk: jm-fault run=%s mode=%s state=%s target=%u remaining=%u"
+             " last_seqno=%" PRIu64 " completed_seqno=%" PRIu64
+             " ring_head=%u ring_count=%u free_atoms=%u lost=%u"
+             " failed_events_observed_injected=%" PRIu64 " error=%d",
+             k->fault.run_id, panvk_jm_fault_mode_name(k->fault.mode), state,
+             k->fault.target,
+             atomic_load_explicit(&k->fault.remaining, memory_order_relaxed),
+             k->last_seqno, k->completed_seqno, k->head, k->count, k->nr_free,
+             k->lost, k->stats.failed_events, error);
+}
+#endif
 
 static bool
 panvk_kbase_chain_enabled(void)
@@ -473,32 +641,51 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
                          const struct base_jd_event_v2 *ev)
 {
    const uint8_t atom = ev->atom_number;
+   uint32_t event_code = ev->event_code;
+
+#ifdef PANVK_JM_FAULT_INJECTION
+   bool injected_failure = false;
+   if (event_code == BASE_JD_EVENT_DONE &&
+       k->atom_use[atom] == PANVK_KBASE_ATOM_SUB &&
+       panvk_kbase_find_sub(k, atom) != NULL &&
+       panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_DONE_FAILURE)) {
+      event_code = PANVK_JD_EVENT_FAULT_START;
+      injected_failure = true;
+   }
+#endif
 
    k->stats.events++;
-   if (ev->event_code != BASE_JD_EVENT_DONE)
+   if (event_code != BASE_JD_EVENT_DONE)
       k->stats.failed_events++;
 
    if (k->atom_use[atom] == PANVK_KBASE_ATOM_AUX) {
-      if (ev->event_code != BASE_JD_EVENT_DONE)
+      if (event_code != BASE_JD_EVENT_DONE)
          mesa_loge("panvk: kbase out-fence atom %u: event 0x%x", atom,
-                   ev->event_code);
+                   event_code);
       panvk_kbase_free_atoms(k, 1, &atom);
       return;
    }
 
    struct panvk_kbase_sub *sub = panvk_kbase_find_sub(k, atom);
    if (!sub) {
-      mesa_loge("panvk: kbase event 0x%x for unknown atom %u", ev->event_code,
+      mesa_loge("panvk: kbase event 0x%x for unknown atom %u", event_code,
                 atom);
       k->lost = true;
       return;
    }
 
-   if (ev->event_code != BASE_JD_EVENT_DONE) {
-      mesa_loge("panvk: kbase atom %u of submission %" PRIu64
-                " failed: event 0x%x",
-                atom, sub->seqno, ev->event_code);
+   if (event_code != BASE_JD_EVENT_DONE) {
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (!injected_failure)
+#endif
+         mesa_loge("panvk: kbase atom %u of submission %" PRIu64
+                   " failed: event 0x%x",
+                   atom, sub->seqno, event_code);
       k->lost = true;
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (injected_failure)
+         panvk_jm_fault_log(k, "CONSUMED", 0);
+#endif
       return;
    }
    if (atom == sub->last)
@@ -532,11 +719,24 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
       return u_cnd_monotonic_timedwait(&k->cnd, &k->mtx, &ts) != thrd_timedout;
    }
 
+#ifdef PANVK_JM_FAULT_INJECTION
+   const bool fault_has_pending = k->count > 0;
+   const bool injected_timeout =
+      fault_has_pending && abs_timeout_ns != 0 &&
+      abs_timeout_ns != OS_TIMEOUT_INFINITE &&
+      panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_PPOLL_TIMEOUT);
+   const bool injected_ppoll_eio =
+      fault_has_pending &&
+      panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_PPOLL_EIO);
+#endif
    k->reading = true;
    mtx_unlock(&k->mtx);
 
    struct pollfd pfd = {.fd = k->fd, .events = POLLIN};
    int ret;
+#ifdef PANVK_JM_FAULT_INJECTION
+   bool injected_failure = injected_ppoll_eio;
+#endif
    do {
       struct timespec rel, *timeout = NULL;
       if (abs_timeout_ns != OS_TIMEOUT_INFINITE) {
@@ -544,8 +744,20 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
          timespec_from_nsec(&rel, abs_timeout_ns > now ? abs_timeout_ns - now : 0);
          timeout = &rel;
       }
-      ret = ppoll(&pfd, 1, timeout, NULL);
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (injected_timeout)
+         ret = ppoll(NULL, 0, timeout, NULL);
+      else if (injected_ppoll_eio) {
+         errno = EIO;
+         ret = -1;
+      } else
+#endif
+         ret = ppoll(&pfd, 1, timeout, NULL);
    } while (ret < 0 && errno == EINTR);
+#ifdef PANVK_JM_FAULT_INJECTION
+   const int injected_timeout_error =
+      injected_timeout && ret != 0 ? (ret < 0 ? errno : EPROTO) : 0;
+#endif
 
    /* poll() said there are events and nobody else reads: read() returns
     * every pending event that fits without blocking. */
@@ -553,7 +765,15 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    ssize_t len = 0;
    bool failed = ret < 0;
    if (ret > 0 && (pfd.revents & POLLIN)) {
-      len = read(k->fd, ev, sizeof(ev));
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (fault_has_pending &&
+          panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_READ_EIO)) {
+         injected_failure = true;
+         errno = EIO;
+         len = -1;
+      } else
+#endif
+         len = read(k->fd, ev, sizeof(ev));
       failed = len <= 0;
       if (len > 0 && len % sizeof(ev[0])) {
          errno = EPROTO;
@@ -563,14 +783,28 @@ panvk_kbase_progress_locked(struct panvk_kbase_jm *k, uint64_t abs_timeout_ns)
    } else if (ret > 0) {
       failed = true; /* POLLERR / POLLHUP / POLLNVAL */
    }
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (failed && !injected_failure && !injected_timeout_error)
+#else
    if (failed)
+#endif
       mesa_loge("panvk: kbase event poll/read failed: %s", strerror(errno));
 
    mtx_lock(&k->mtx);
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (injected_timeout && ret == 0)
+      panvk_jm_fault_log(k, "CONSUMED", 0);
+#endif
    for (unsigned i = 0; len > 0 && !k->lost && i < len / sizeof(ev[0]); i++)
       panvk_kbase_handle_event(k, &ev[i]);
    if (failed)
       k->lost = true;
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (injected_timeout_error)
+      panvk_jm_fault_log(k, "INJECTION_ERROR", injected_timeout_error);
+   else if (injected_failure)
+      panvk_jm_fault_log(k, "CONSUMED", 0);
+#endif
    k->reading = false;
    u_cnd_monotonic_broadcast(&k->cnd);
    return ret != 0;
@@ -696,11 +930,26 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
       .nr_atoms = nr_atoms,
       .stride = PANVK_KBASE_ATOM_STRIDE,
    };
+#ifdef PANVK_JM_FAULT_INJECTION
+   bool injected_submit =
+      panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_SUBMIT_EIO);
+   if (injected_submit)
+      errno = EIO;
+   if (injected_submit || ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+#else
    if (ioctl(k->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+#endif
       /* Some atoms may be in the kernel: keep their numbers, give up. */
-      mesa_loge("panvk: kbase JOB_SUBMIT of %u atoms failed: %s", nr_atoms,
-                strerror(errno));
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (!injected_submit)
+#endif
+         mesa_loge("panvk: kbase JOB_SUBMIT of %u atoms failed: %s", nr_atoms,
+                   strerror(errno));
       k->lost = true;
+#ifdef PANVK_JM_FAULT_INJECTION
+      if (injected_submit)
+         panvk_jm_fault_log(k, "CONSUMED", 0);
+#endif
       u_cnd_monotonic_broadcast(&k->cnd);
       return VK_ERROR_DEVICE_LOST;
    }
@@ -1399,11 +1648,27 @@ panvk_kbase_jm_create(struct panvk_device *device, struct panvk_kbase_jm **out)
    k->ctrl_no_fence_wait_dep =
       os_get_option("PANVK_KBASE_CTRL_NO_FENCE_WAIT_DEP") != NULL;
    k->ctrl_export_early = os_get_option("PANVK_KBASE_CTRL_EXPORT_EARLY") != NULL;
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (!panvk_jm_fault_parser_self_test()) {
+      mesa_loge("panvk: jm-fault state=SELF_TEST_FAILED");
+      goto err_free;
+   }
+   const char *fault_selector = os_get_option("PANVK_JM_FAULT");
+   if (fault_selector && !panvk_jm_fault_parse(fault_selector, &k->fault)) {
+      mesa_loge("panvk: jm-fault state=REJECTED");
+      goto err_free;
+   }
+#endif
 
    if (mtx_init(&k->mtx, mtx_plain) != thrd_success)
       goto err_free;
    if (u_cnd_monotonic_init(&k->cnd) != thrd_success)
       goto err_mtx;
+
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (k->fault.mode != PANVK_JM_FAULT_NONE)
+      panvk_jm_fault_log(k, "ARMED", 0);
+#endif
 
    *out = k;
    return VK_SUCCESS;
@@ -1425,6 +1690,13 @@ panvk_kbase_jm_destroy(struct panvk_device *device, struct panvk_kbase_jm *k)
     * a hung GPU gets a bounded wait (kbase stops hung jobs by itself). */
    uint64_t seqno;
    mtx_lock(&k->mtx);
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (k->fault.mode != PANVK_JM_FAULT_NONE &&
+       !atomic_load_explicit(&k->fault.consumed, memory_order_acquire)) {
+      panvk_jm_fault_log(k, "UNCONSUMED", 0);
+      atomic_store_explicit(&k->fault.remaining, 0, memory_order_relaxed);
+   }
+#endif
    seqno = k->last_seqno;
    mtx_unlock(&k->mtx);
    if (panvk_kbase_wait_seqno(k, seqno, os_time_get_absolute_timeout(
