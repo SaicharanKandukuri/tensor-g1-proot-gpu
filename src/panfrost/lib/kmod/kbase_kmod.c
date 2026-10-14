@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/dma-heap.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -54,6 +55,145 @@
 /* Only used as the interchange format for CSF interface information; no
  * panthor functionality is required. */
 #include "drm-uapi/panthor_drm.h"
+
+#define KBASE_JM_ABI_IOCTL(cmd, expected_nr, expected_dir, expected_size)      \
+   _Static_assert(_IOC_TYPE(cmd) == KBASE_IOCTL_TYPE,                          \
+                  "Tensor G1 JM " #cmd " type ABI");                           \
+   _Static_assert(_IOC_NR(cmd) == (expected_nr),                               \
+                  "Tensor G1 JM " #cmd " number ABI");                         \
+   _Static_assert(_IOC_DIR(cmd) == (expected_dir),                             \
+                  "Tensor G1 JM " #cmd " direction ABI");                      \
+   _Static_assert(_IOC_SIZE(cmd) == (expected_size),                           \
+                  "Tensor G1 JM " #cmd " encoded size ABI")
+
+#define KBASE_JM_ABI_SIZE(type, expected_size)                                 \
+   _Static_assert(sizeof(type) == (expected_size),                             \
+                  "Tensor G1 JM " #type " size ABI")
+
+#define KBASE_JM_ABI_OFFSET(type, member, expected_offset)                     \
+   _Static_assert(offsetof(type, member) == (expected_offset),                 \
+                  "Tensor G1 JM " #type "." #member " offset ABI")
+
+_Static_assert(sizeof(void *) == 8, "Tensor G1 JM userspace pointer ABI");
+_Static_assert(KBASE_IOCTL_TYPE == 0x80, "Tensor G1 JM ioctl type ABI");
+
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_VERSION_CHECK_CSF, 52, _IOC_READ | _IOC_WRITE,
+                   4);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_VERSION_CHECK_JM, 0, _IOC_READ | _IOC_WRITE, 4);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_SET_FLAGS, 1, _IOC_WRITE, 4);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_GET_GPUPROPS, 3, _IOC_WRITE, 16);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_ALLOC, 5, _IOC_READ | _IOC_WRITE, 32);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_FREE, 7, _IOC_WRITE, 8);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_JIT_INIT, 14, _IOC_WRITE, 24);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_SYNC, 15, _IOC_WRITE, 32);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_ALIAS, 21, _IOC_READ | _IOC_WRITE, 32);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_IMPORT, 22, _IOC_READ | _IOC_WRITE, 24);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_EXEC_INIT, 38, _IOC_WRITE, 8);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, 50, _IOC_READ | _IOC_WRITE,
+                   32);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_version_check, 4);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_version_check, major, 0);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_version_check, minor, 2);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_set_flags, 4);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_set_flags, create_flags, 0);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_get_gpuprops, 16);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, buffer, 0);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, size, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, flags, 12);
+
+KBASE_JM_ABI_SIZE(union kbase_ioctl_mem_alloc, 32);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.va_pages, 0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.commit_pages, 8);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.extension, 16);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.flags, 24);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, out.flags, 0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, out.gpu_va, 8);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_free, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_free, gpu_addr, 0);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_jit_init, 24);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, va_pages, 0);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, max_allocations, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, phys_pages, 16);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_sync, 32);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, handle, 0);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, user_addr, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, size, 16);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, type, 24);
+
+KBASE_JM_ABI_SIZE(struct base_mem_aliasing_info, 24);
+KBASE_JM_ABI_OFFSET(struct base_mem_aliasing_info, handle, 0);
+KBASE_JM_ABI_OFFSET(struct base_mem_aliasing_info, offset, 8);
+KBASE_JM_ABI_OFFSET(struct base_mem_aliasing_info, length, 16);
+
+KBASE_JM_ABI_SIZE(union kbase_ioctl_mem_alias, 32);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, in.flags, 0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, in.stride, 8);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, in.nents, 16);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, in.aliasing_info, 24);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, out.gpu_va, 8);
+
+KBASE_JM_ABI_SIZE(union kbase_ioctl_mem_import, 24);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.flags, 0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.phandle, 8);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.type, 16);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, out.flags, 0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, out.gpu_va, 8);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, out.va_pages, 16);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_exec_init, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_exec_init, va_pages, 0);
+
+KBASE_JM_ABI_SIZE(union kbase_ioctl_get_cpu_gpu_timeinfo, 32);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_get_cpu_gpu_timeinfo, in.request_flags,
+                    0);
+KBASE_JM_ABI_OFFSET(union kbase_ioctl_get_cpu_gpu_timeinfo, out.timestamp, 16);
+
+_Static_assert(BASE_MEM_MAP_TRACKING_HANDLE == (3ull << 12),
+               "Tensor G1 JM tracking handle ABI");
+_Static_assert(BASE_MEM_PROT_CPU_RD == ((__u64)1 << 0),
+               "Tensor G1 JM CPU read flag ABI");
+_Static_assert(BASE_MEM_PROT_CPU_WR == ((__u64)1 << 1),
+               "Tensor G1 JM CPU write flag ABI");
+_Static_assert(BASE_MEM_PROT_GPU_RD == ((__u64)1 << 2),
+               "Tensor G1 JM GPU read flag ABI");
+_Static_assert(BASE_MEM_PROT_GPU_WR == ((__u64)1 << 3),
+               "Tensor G1 JM GPU write flag ABI");
+_Static_assert(BASE_MEM_PROT_GPU_EX == ((__u64)1 << 4),
+               "Tensor G1 JM GPU executable flag ABI");
+_Static_assert(BASE_MEM_GROW_ON_GPF == ((__u64)1 << 9),
+               "Tensor G1 JM grow-on-fault flag ABI");
+_Static_assert(BASE_MEM_COHERENT_SYSTEM == ((__u64)1 << 10),
+               "Tensor G1 JM system coherency flag ABI");
+_Static_assert(BASE_MEM_COHERENT_LOCAL == ((__u64)1 << 11),
+               "Tensor G1 JM local coherency flag ABI");
+_Static_assert(BASE_MEM_CACHED_CPU == ((__u64)1 << 12),
+               "Tensor G1 JM cached CPU flag ABI");
+_Static_assert(BASE_MEM_SAME_VA == ((__u64)1 << 13),
+               "Tensor G1 JM same-VA flag ABI");
+_Static_assert(BASE_MEM_NEED_MMAP == ((__u64)1 << 14),
+               "Tensor G1 JM mmap-required flag ABI");
+_Static_assert(BASE_MEM_IMPORT_SHARED == ((__u64)1 << 18),
+               "Tensor G1 JM shared import flag ABI");
+_Static_assert(BASE_MEM_UNCACHED_GPU == ((__u64)1 << 21),
+               "Tensor G1 JM uncached GPU flag ABI");
+_Static_assert(BASE_MEM_IMPORT_TYPE_UMM == 2,
+               "Tensor G1 JM UMM import type ABI");
+_Static_assert(BASE_SYNCSET_OP_MSYNC == 1,
+               "Tensor G1 JM memory clean operation ABI");
+_Static_assert(BASE_SYNCSET_OP_CSYNC == 2,
+               "Tensor G1 JM memory invalidate operation ABI");
+_Static_assert(BASE_TIMEINFO_TIMESTAMP_FLAG == (1u << 1),
+               "Tensor G1 JM timestamp request flag ABI");
+
+#undef KBASE_JM_ABI_OFFSET
+#undef KBASE_JM_ABI_SIZE
+#undef KBASE_JM_ABI_IOCTL
 
 #include "kbase_kmod.h"
 #include "pan_kmod_backend.h"
