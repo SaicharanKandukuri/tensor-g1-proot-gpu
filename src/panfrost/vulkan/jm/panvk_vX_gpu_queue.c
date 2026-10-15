@@ -395,6 +395,7 @@ enum panvk_jm_fault_mode {
    PANVK_JM_FAULT_PPOLL_TIMEOUT,
    PANVK_JM_FAULT_READ_EIO,
    PANVK_JM_FAULT_DONE_FAILURE,
+   PANVK_JM_FAULT_HOLD_AFTER_SUBMIT,
 };
 
 struct panvk_jm_fault {
@@ -419,6 +420,8 @@ panvk_jm_fault_mode_name(enum panvk_jm_fault_mode mode)
       return "read-eio";
    case PANVK_JM_FAULT_DONE_FAILURE:
       return "done-failure";
+   case PANVK_JM_FAULT_HOLD_AFTER_SUBMIT:
+      return "hold-after-submit";
    default:
       return "none";
    }
@@ -436,6 +439,7 @@ panvk_jm_fault_parse_mode(const char *name, size_t len)
       {"ppoll-timeout", PANVK_JM_FAULT_PPOLL_TIMEOUT},
       {"read-eio", PANVK_JM_FAULT_READ_EIO},
       {"done-failure", PANVK_JM_FAULT_DONE_FAILURE},
+      {"hold-after-submit", PANVK_JM_FAULT_HOLD_AFTER_SUBMIT},
    };
 
    for (unsigned i = 0; i < ARRAY_SIZE(modes); i++) {
@@ -505,7 +509,10 @@ panvk_jm_fault_parser_self_test(void)
           !panvk_jm_fault_parse("bad\nrun:read-eio", &fault) &&
           !panvk_jm_fault_parse("bad run:read-eio", &fault) &&
           !panvk_jm_fault_parse("self:read-eio:+1", &fault) &&
-          !panvk_jm_fault_parse("self:read-eio:-1", &fault);
+          !panvk_jm_fault_parse("self:read-eio:-1", &fault) &&
+          panvk_jm_fault_parse("self:hold-after-submit", &fault) &&
+          fault.mode == PANVK_JM_FAULT_HOLD_AFTER_SUBMIT && fault.target == 1 &&
+          !strcmp(fault.run_id, "self");
 }
 #endif
 
@@ -966,6 +973,29 @@ panvk_kbase_submit_locked(struct panvk_kbase_jm *k,
    };
    memcpy(sub->atoms, nums, nr_atoms);
    *seqno = sub->seqno;
+#ifdef PANVK_JM_FAULT_INJECTION
+   if (panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_HOLD_AFTER_SUBMIT)) {
+      if (!k->count || k->last_seqno <= k->completed_seqno ||
+          k->nr_free >= 255 || k->lost) {
+         k->lost = true;
+         panvk_jm_fault_log(k, "INJECTION_ERROR", EPROTO);
+         u_cnd_monotonic_broadcast(&k->cnd);
+         return VK_ERROR_DEVICE_LOST;
+      }
+
+      panvk_jm_fault_log(k, "READY_FOR_KILL", 0);
+      int ret;
+      do {
+         ret = ppoll(NULL, 0, NULL, NULL);
+      } while (ret < 0 && errno == EINTR);
+
+      const int error = ret < 0 ? errno : EPROTO;
+      k->lost = true;
+      panvk_jm_fault_log(k, "INJECTION_ERROR", error);
+      u_cnd_monotonic_broadcast(&k->cnd);
+      return VK_ERROR_DEVICE_LOST;
+   }
+#endif
    return VK_SUCCESS;
 }
 
