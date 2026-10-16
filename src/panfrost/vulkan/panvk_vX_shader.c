@@ -1657,6 +1657,7 @@ panvk_compile_shader(struct panvk_device *dev,
                      struct vk_shader_compile_info *info,
                      const struct vk_graphics_pipeline_state *state,
                      const struct pan_varying_layout *vs_varying_layout,
+                     uint32_t clip_distance_mask,
                      const uint32_t *noperspective_varyings,
                      const VkAllocationCallbacks *pAllocator,
                      struct vk_shader **shader_out)
@@ -1960,6 +1961,9 @@ panvk_compile_shader(struct panvk_device *dev,
        */
       nir_assign_io_var_locations(nir, nir_var_shader_in);
 
+      if (clip_distance_mask)
+         NIR_PASS(_, nir, nir_lower_clip_fs, clip_distance_mask, true, true);
+
       /* VS (if known) decides the memory layout */
       inputs.varying_layout = vs_varying_layout;
 
@@ -2107,6 +2111,7 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    struct panvk_device *dev = to_panvk_device(vk_dev);
    bool use_static_noperspective = false;
    uint32_t noperspective_varyings = 0;
+   uint32_t clip_distance_mask = 0;
    VkResult result;
    int32_t i;
 
@@ -2146,6 +2151,17 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       nir_shader *nir = infos[shader_count - 1].nir;
       noperspective_varyings = pan_nir_collect_noperspective_varyings_fs(nir);
       use_static_noperspective = true;
+
+      if (shader_count > 1) {
+         nir_shader *producer = infos[shader_count - 2].nir;
+         nir_foreach_variable_with_modes(var, producer, nir_var_shader_out) {
+            if (var->data.location == VARYING_SLOT_CLIP_DIST0) {
+               assert(var->data.compact);
+               clip_distance_mask = BITFIELD_MASK(glsl_get_length(var->type));
+               break;
+            }
+         }
+      }
    }
 
    /* Vulkan runtime passes us shaders in stage order */
@@ -2175,6 +2191,7 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       }
 
       result = panvk_compile_shader(dev, &infos[i], state, vs_varying_layout,
+                                    clip_distance_mask,
                                     noperspective_varyings_ptr, pAllocator,
                                     &shaders_out[i]);
 
@@ -3123,8 +3140,8 @@ VkResult panvk_per_arch(create_shader)(
    panvk_preprocess_nir(dev->vk.physical, nir, &rs);
 
    struct vk_shader *vk_shader;
-   VkResult result = panvk_compile_shader(dev, &info, NULL, NULL, NULL, NULL,
-                                          &vk_shader);
+   VkResult result = panvk_compile_shader(dev, &info, NULL, NULL, 0, NULL,
+                                          NULL, &vk_shader);
    if (result != VK_SUCCESS)
       return result;
 
