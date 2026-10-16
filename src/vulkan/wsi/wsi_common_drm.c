@@ -370,7 +370,7 @@ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
    /* We don't need implicit sync if explicit sync is available through the
     * window system protocol.
     */
-   if (chain->image_info.explicit_sync)
+   if (chain->image_info.explicit_sync || chain->wsi->wait_present_before_queue)
       return VK_SUCCESS;
 
    VkResult result =
