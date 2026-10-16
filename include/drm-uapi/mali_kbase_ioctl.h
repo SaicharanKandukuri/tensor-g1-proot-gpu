@@ -80,13 +80,22 @@ typedef __u32 base_jd_core_req;
 #define BASE_JD_DEP_TYPE_DATA    (1U << 0)
 #define BASE_JD_DEP_TYPE_ORDER   (1U << 1)
 
+#define BASE_JD_REQ_FS ((base_jd_core_req)1 << 0)
+#define BASE_JD_REQ_CS ((base_jd_core_req)1 << 1)
+#define BASE_JD_REQ_T ((base_jd_core_req)1 << 2)
+#define BASE_JD_REQ_V ((base_jd_core_req)1 << 4)
 #define BASE_JD_REQ_DEP                   ((base_jd_core_req)0)
 #define BASE_JD_REQ_SOFT_JOB              ((base_jd_core_req)1 << 9)
 #define BASE_JD_REQ_SOFT_FENCE_TRIGGER    (BASE_JD_REQ_SOFT_JOB | 0x2)
 #define BASE_JD_REQ_SOFT_FENCE_WAIT       (BASE_JD_REQ_SOFT_JOB | 0x3)
 #define BASE_JD_REQ_EVENT_ONLY_ON_FAILURE ((base_jd_core_req)1 << 12)
 
+#define BASE_JD_EVENT_NOT_STARTED 0x00
 #define BASE_JD_EVENT_DONE 0x01
+#define BASE_JD_EVENT_STOPPED 0x03
+#define BASE_JD_EVENT_TERMINATED 0x04
+#define BASE_JD_EVENT_ACTIVE 0x08
+#define BASE_JD_EVENT_RANGE_HW_FAULT_OR_SW_ERROR_START 0x40
 
 struct base_dependency {
    base_atom_id atom_id;
@@ -129,6 +138,11 @@ struct kbase_ioctl_get_gpuprops {
 };
 #define KBASE_IOCTL_GET_GPUPROPS \
    _IOW(KBASE_IOCTL_TYPE, 3, struct kbase_ioctl_get_gpuprops)
+
+#define KBASE_GPUPROP_VALUE_SIZE_U8 0
+#define KBASE_GPUPROP_VALUE_SIZE_U16 1
+#define KBASE_GPUPROP_VALUE_SIZE_U32 2
+#define KBASE_GPUPROP_VALUE_SIZE_U64 3
 
 /* GPU property keys used in the serialised blob returned by GET_GPUPROPS.
  * Each entry is encoded as:

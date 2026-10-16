@@ -48,6 +48,16 @@
 #include "pan_v9_trace.h"
 
 _Static_assert(sizeof(void *) == 8, "kbase JM requires 64-bit userspace");
+_Static_assert(sizeof(base_atom_id) == 1, "base_atom_id ABI");
+_Static_assert(sizeof(base_jd_dep_type) == 1, "base_jd_dep_type ABI");
+_Static_assert(sizeof(base_jd_core_req) == 4, "base_jd_core_req ABI");
+_Static_assert(sizeof(struct base_dependency) == 2, "base_dependency ABI");
+_Static_assert(_Alignof(struct base_dependency) == 1,
+               "base_dependency alignment");
+_Static_assert(offsetof(struct base_dependency, atom_id) == 0,
+               "base_dependency.atom_id ABI");
+_Static_assert(offsetof(struct base_dependency, dependency_type) == 1,
+               "base_dependency.dependency_type ABI");
 _Static_assert(sizeof(base_jd_atom) == 64, "base_jd_atom ABI");
 _Static_assert(_Alignof(base_jd_atom) == 8, "base_jd_atom alignment");
 _Static_assert(offsetof(base_jd_atom, jc) == 8, "base_jd_atom.jc ABI");
@@ -58,6 +68,8 @@ _Static_assert(offsetof(base_jd_atom, atom_number) == 48,
 _Static_assert(offsetof(base_jd_atom, core_req) == 52,
                "base_jd_atom.core_req ABI");
 _Static_assert(sizeof(struct base_jd_event_v2) == 24, "base_jd_event_v2 ABI");
+_Static_assert(_Alignof(struct base_jd_event_v2) == 8,
+               "base_jd_event_v2 alignment");
 _Static_assert(offsetof(struct base_jd_event_v2, event_code) == 0,
                "base_jd_event_v2.event_code ABI");
 _Static_assert(offsetof(struct base_jd_event_v2, atom_number) == 4,
@@ -65,12 +77,15 @@ _Static_assert(offsetof(struct base_jd_event_v2, atom_number) == 4,
 _Static_assert(offsetof(struct base_jd_event_v2, udata) == 8,
                "base_jd_event_v2.udata ABI");
 _Static_assert(sizeof(struct base_fence) == 8, "base_fence ABI");
+_Static_assert(_Alignof(struct base_fence) == 4, "base_fence alignment");
 _Static_assert(__builtin_offsetof(struct base_fence, basep.fd) == 0,
                "base_fence.fd ABI");
 _Static_assert(__builtin_offsetof(struct base_fence, basep.stream_fd) == 4,
                "base_fence.stream_fd ABI");
 _Static_assert(sizeof(struct kbase_ioctl_job_submit) == 16,
                "kbase_ioctl_job_submit ABI");
+_Static_assert(_Alignof(struct kbase_ioctl_job_submit) == 8,
+               "kbase_ioctl_job_submit alignment");
 _Static_assert(offsetof(struct kbase_ioctl_job_submit, addr) == 0,
                "kbase_ioctl_job_submit.addr ABI");
 _Static_assert(offsetof(struct kbase_ioctl_job_submit, nr_atoms) == 8,
@@ -87,6 +102,10 @@ _Static_assert(_IOC_SIZE(KBASE_IOCTL_JOB_SUBMIT) == 16,
                "KBASE_IOCTL_JOB_SUBMIT size ABI");
 _Static_assert(BASE_JD_DEP_TYPE_DATA == 1, "JM data dependency ABI");
 _Static_assert(BASE_JD_DEP_TYPE_ORDER == 2, "JM order dependency ABI");
+_Static_assert(BASE_JD_REQ_FS == 1, "JM fragment core requirement ABI");
+_Static_assert(BASE_JD_REQ_CS == 2, "JM compute core requirement ABI");
+_Static_assert(BASE_JD_REQ_T == 4, "JM tiler core requirement ABI");
+_Static_assert(BASE_JD_REQ_V == 16, "JM vertex core requirement ABI");
 _Static_assert(BASE_JD_REQ_DEP == 0, "JM dependency atom ABI");
 _Static_assert(BASE_JD_REQ_SOFT_JOB == 512, "JM soft job ABI");
 _Static_assert(BASE_JD_REQ_SOFT_FENCE_TRIGGER == 514,
@@ -94,7 +113,13 @@ _Static_assert(BASE_JD_REQ_SOFT_FENCE_TRIGGER == 514,
 _Static_assert(BASE_JD_REQ_SOFT_FENCE_WAIT == 515, "JM fence wait ABI");
 _Static_assert(BASE_JD_REQ_EVENT_ONLY_ON_FAILURE == 4096,
                "JM event suppression ABI");
+_Static_assert(BASE_JD_EVENT_NOT_STARTED == 0, "JM not-started event ABI");
 _Static_assert(BASE_JD_EVENT_DONE == 1, "JM done event ABI");
+_Static_assert(BASE_JD_EVENT_STOPPED == 3, "JM stopped event ABI");
+_Static_assert(BASE_JD_EVENT_TERMINATED == 4, "JM terminated event ABI");
+_Static_assert(BASE_JD_EVENT_ACTIVE == 8, "JM active event ABI");
+_Static_assert(BASE_JD_EVENT_RANGE_HW_FAULT_OR_SW_ERROR_START == 0x40,
+               "JM fault-range event ABI");
 
 /*
  * Dumps the first bytes of the tiler heap so a caller can diff the contents
@@ -248,26 +273,24 @@ panvk_debug_dump_tiler_heap(struct panvk_device *dev, const char *label)
  * batch->jobs holds the CPU pointers of every job descriptor in the batch,
  * which is exactly what we need - these are pool allocations, still mapped.
  */
-#define PANVK_JD_EVENT_NOT_STARTED 0x00
-#define PANVK_JD_EVENT_DONE        0x01
-#define PANVK_JD_EVENT_FAULT_START 0x40
-
 static const char *
 panvk_jd_event_str(uint32_t code)
 {
    switch (code) {
-   case PANVK_JD_EVENT_NOT_STARTED:
+   case BASE_JD_EVENT_NOT_STARTED:
       return "NOT_STARTED";
-   case PANVK_JD_EVENT_DONE:
+   case BASE_JD_EVENT_DONE:
       return "DONE";
-   case 0x03:
+   case BASE_JD_EVENT_STOPPED:
       return "STOPPED";
-   case 0x04:
+   case BASE_JD_EVENT_TERMINATED:
       return "TERMINATED";
-   case 0x08:
+   case BASE_JD_EVENT_ACTIVE:
       return "ACTIVE";
    default:
-      return code >= PANVK_JD_EVENT_FAULT_START ? "FAULT" : "non-fatal";
+      return code >= BASE_JD_EVENT_RANGE_HW_FAULT_OR_SW_ERROR_START
+                ? "FAULT"
+                : "non-fatal";
    }
 }
 
@@ -305,10 +328,9 @@ panvk_debug_dump_job_status(struct panvk_cmd_buffer *cmdbuf,
               " fault_pointer=0x%" PRIx64 "%s\n",
               label, idx, (word4 >> 1) & BITFIELD_MASK(7),
               (word4 >> 16) & 0xffff, word5 & 0xffff, (word5 >> 16) & 0xffff,
-              next_job, exception_status,
-              panvk_jd_event_str(exception_status), first_incomplete_task,
-              fault_pointer,
-              exception_status >= PANVK_JD_EVENT_FAULT_START
+              next_job, exception_status, panvk_jd_event_str(exception_status),
+              first_incomplete_task, fault_pointer,
+              exception_status >= BASE_JD_EVENT_RANGE_HW_FAULT_OR_SW_ERROR_START
                  ? "  <== GPU FAULT"
                  : "");
       idx++;
@@ -656,7 +678,7 @@ panvk_kbase_handle_event(struct panvk_kbase_jm *k,
        k->atom_use[atom] == PANVK_KBASE_ATOM_SUB &&
        panvk_kbase_find_sub(k, atom) != NULL &&
        panvk_jm_fault_try_consume(k, PANVK_JM_FAULT_DONE_FAILURE)) {
-      event_code = PANVK_JD_EVENT_FAULT_START;
+      event_code = BASE_JD_EVENT_RANGE_HW_FAULT_OR_SW_ERROR_START;
       injected_failure = true;
    }
 #endif
@@ -1194,6 +1216,30 @@ panvk_kbase_chain_has_batch(const struct panvk_kbase_chain *c,
    return false;
 }
 
+static void
+panvk_reset_job_for_reissue(void *job)
+{
+#if PAN_ARCH >= 9
+   uint32_t word4;
+   memcpy(&word4, (uint8_t *)job + 16, sizeof(word4));
+
+   if (((word4 >> 1) & BITFIELD_MASK(7)) == MALI_JOB_TYPE_MALLOC_VERTEX) {
+      pan_section_unpack(job, MALLOC_VERTEX_JOB, DRAW, draw);
+
+      /* Malloc-vertex jobs replace this packet request with the allocated
+       * vertex-array address. Restore the request before resubmission. */
+      draw.vertex_array.packet = true;
+      draw.vertex_array.pointer = 0;
+      draw.vertex_array.vertex_packet_stride = 0;
+      draw.vertex_array.vertex_attribute_stride = 0;
+
+      pan_section_pack(job, MALLOC_VERTEX_JOB, DRAW, cfg) { cfg = draw; }
+   }
+#endif
+
+   memset(job, 0, 4 * 4);
+}
+
 static VkResult
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
@@ -1223,7 +1269,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
          return result;
 
       util_dynarray_foreach(&batch->jobs, void *, job)
-         memset((*job), 0, 4 * 4);
+         panvk_reset_job_for_reissue(*job);
 
       /* Reset the tiler before re-issuing the batch */
       if (batch->tiler.ctx_descs.cpu) {
@@ -1271,14 +1317,14 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (ret)
          mesa_loge("panvk: v9 vtc_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
-      if (result != VK_SUCCESS)
-         return result;
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] vtc_jc ret=%d\n", ret);
          panvk_debug_dump_job_status(cmdbuf, batch, "vtc_jc");
          panvk_debug_dump_tiler_heap(dev, "SESUDAH vtc_jc (vertex+tiler)");
       }
+      if (result != VK_SUCCESS)
+         return result;
 
       if (PANVK_DEBUG(TRACE)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
@@ -1301,14 +1347,14 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (ret)
          mesa_loge("panvk: v9 frag_jc job chain failed: %d "
                    "(PANVK_V9_TRACE=1 dumps the job status)", result);
-      if (result != VK_SUCCESS)
-         return result;
       if (pan_v9_trace_enabled() || getenv("PANVK_HEAP_LOG")) {
          fprintf(panvk_debug_log_file(),
                  "[PANVK_DEBUG_SUBMIT] frag_jc ret=%d\n", ret);
          panvk_debug_dump_job_status(cmdbuf, batch, "frag_jc");
          panvk_debug_dump_tiler_heap(dev, "SESUDAH frag_jc (fragment)");
       }
+      if (result != VK_SUCCESS)
+         return result;
       if (PANVK_DEBUG(TRACE)) {
          /* If we want to read the descriptors back, we need to invalidate the
           * whole desc pool, otherwise we might end up with stale data. */

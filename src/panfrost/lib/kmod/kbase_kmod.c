@@ -70,6 +70,10 @@
    _Static_assert(sizeof(type) == (expected_size),                             \
                   "Tensor G1 JM " #type " size ABI")
 
+#define KBASE_JM_ABI_ALIGN(type, expected_align)                               \
+   _Static_assert(_Alignof(type) == (expected_align),                          \
+                  "Tensor G1 JM " #type " alignment ABI")
+
 #define KBASE_JM_ABI_OFFSET(type, member, expected_offset)                     \
    _Static_assert(offsetof(type, member) == (expected_offset),                 \
                   "Tensor G1 JM " #type "." #member " offset ABI")
@@ -93,18 +97,22 @@ KBASE_JM_ABI_IOCTL(KBASE_IOCTL_GET_CPU_GPU_TIMEINFO, 50, _IOC_READ | _IOC_WRITE,
                    32);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_version_check, 4);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_version_check, 2);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_version_check, major, 0);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_version_check, minor, 2);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_set_flags, 4);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_set_flags, 4);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_set_flags, create_flags, 0);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_get_gpuprops, 16);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_get_gpuprops, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, buffer, 0);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, size, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_get_gpuprops, flags, 12);
 
 KBASE_JM_ABI_SIZE(union kbase_ioctl_mem_alloc, 32);
+KBASE_JM_ABI_ALIGN(union kbase_ioctl_mem_alloc, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.va_pages, 0);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.commit_pages, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, in.extension, 16);
@@ -113,14 +121,17 @@ KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, out.flags, 0);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alloc, out.gpu_va, 8);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_free, 8);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_mem_free, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_free, gpu_addr, 0);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_jit_init, 24);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_mem_jit_init, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, va_pages, 0);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, max_allocations, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_jit_init, phys_pages, 16);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_sync, 32);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_mem_sync, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, handle, 0);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, user_addr, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_sync, size, 16);
@@ -139,6 +150,7 @@ KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, in.aliasing_info, 24);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_alias, out.gpu_va, 8);
 
 KBASE_JM_ABI_SIZE(union kbase_ioctl_mem_import, 24);
+KBASE_JM_ABI_ALIGN(union kbase_ioctl_mem_import, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.flags, 0);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.phandle, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, in.type, 16);
@@ -147,9 +159,11 @@ KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, out.gpu_va, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_mem_import, out.va_pages, 16);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_mem_exec_init, 8);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_mem_exec_init, 8);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_mem_exec_init, va_pages, 0);
 
 KBASE_JM_ABI_SIZE(union kbase_ioctl_get_cpu_gpu_timeinfo, 32);
+KBASE_JM_ABI_ALIGN(union kbase_ioctl_get_cpu_gpu_timeinfo, 8);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_get_cpu_gpu_timeinfo, in.request_flags,
                     0);
 KBASE_JM_ABI_OFFSET(union kbase_ioctl_get_cpu_gpu_timeinfo, out.timestamp, 16);
@@ -191,7 +205,55 @@ _Static_assert(BASE_SYNCSET_OP_CSYNC == 2,
 _Static_assert(BASE_TIMEINFO_TIMESTAMP_FLAG == (1u << 1),
                "Tensor G1 JM timestamp request flag ABI");
 
+_Static_assert(KBASE_GPUPROP_VALUE_SIZE_U8 == 0,
+               "Tensor G1 JM u8 property size ABI");
+_Static_assert(KBASE_GPUPROP_VALUE_SIZE_U16 == 1,
+               "Tensor G1 JM u16 property size ABI");
+_Static_assert(KBASE_GPUPROP_VALUE_SIZE_U32 == 2,
+               "Tensor G1 JM u32 property size ABI");
+_Static_assert(KBASE_GPUPROP_VALUE_SIZE_U64 == 3,
+               "Tensor G1 JM u64 property size ABI");
+_Static_assert(KBASE_GPUPROP_PRODUCT_ID == 1,
+               "Tensor G1 JM product property ABI");
+_Static_assert(KBASE_GPUPROP_VERSION_STATUS == 2,
+               "Tensor G1 JM version status property ABI");
+_Static_assert(KBASE_GPUPROP_MINOR_REVISION == 3,
+               "Tensor G1 JM minor revision property ABI");
+_Static_assert(KBASE_GPUPROP_MAJOR_REVISION == 4,
+               "Tensor G1 JM major revision property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_SHADER_PRESENT == 25,
+               "Tensor G1 JM shader-present property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_CORE_FEATURES == 30,
+               "Tensor G1 JM core-features property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_MEM_FEATURES == 31,
+               "Tensor G1 JM memory-features property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_MMU_FEATURES == 32,
+               "Tensor G1 JM MMU-features property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_TILER_FEATURES == 51,
+               "Tensor G1 JM tiler-features property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_TEXTURE_FEATURES_0 == 52,
+               "Tensor G1 JM texture-features-0 property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_TEXTURE_FEATURES_1 == 53,
+               "Tensor G1 JM texture-features-1 property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_TEXTURE_FEATURES_2 == 54,
+               "Tensor G1 JM texture-features-2 property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_GPU_ID == 55,
+               "Tensor G1 JM GPU-ID property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_THREAD_MAX_THREADS == 56,
+               "Tensor G1 JM max-threads property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_THREAD_MAX_WORKGROUP_SIZE == 57,
+               "Tensor G1 JM max-workgroup property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_THREAD_FEATURES == 59,
+               "Tensor G1 JM thread-features property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_COHERENCY_MODE == 60,
+               "Tensor G1 JM coherency-mode property ABI");
+_Static_assert(KBASE_GPUPROP_RAW_TEXTURE_FEATURES_3 == 81,
+               "Tensor G1 JM texture-features-3 property ABI");
+_Static_assert(KBASE_GPUPROP_TLS_ALLOC == 84,
+               "Tensor G1 JM TLS-allocation property ABI");
+
 #undef KBASE_JM_ABI_OFFSET
+#undef KBASE_JM_ABI_ALIGN
 #undef KBASE_JM_ABI_SIZE
 #undef KBASE_JM_ABI_IOCTL
 
