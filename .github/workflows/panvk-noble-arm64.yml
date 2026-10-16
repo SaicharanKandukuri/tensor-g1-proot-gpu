@@ -1,0 +1,101 @@
+name: Build PanVK Noble arm64
+
+on:
+  push:
+    branches:
+      - build/panvk-noble-arm64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bison build-essential ca-certificates cmake flex glslang-tools \
+            libclang-cpp-dev libclang-dev libclc-18-dev libdrm-dev libelf-dev \
+            libexpat1-dev libllvmspirvlib-18-dev libx11-dev libx11-xcb-dev \
+            libxrandr-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev \
+            libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev libxshmfence-dev \
+            libxxf86vm-dev llvm-dev ninja-build pkgconf python3 python3-mako \
+            python3-packaging python3-pip python3-setuptools python3-yaml \
+            spirv-tools zlib1g-dev
+          python3 -m pip install --break-system-packages 'meson>=1.4.0,<2'
+
+      - name: Build native PanVK kbase ICD
+        shell: bash
+        run: |
+          meson setup build-noble \
+            --buildtype=release \
+            --prefix=/opt/udroid/panvk \
+            --libdir=lib \
+            -Db_ndebug=true \
+            -Dbuild-tests=false \
+            -Ddisplay-info=disabled \
+            -Degl=disabled \
+            -Denable-glcpp-tests=false \
+            -Dgallium-drivers= \
+            -Dgbm=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dglx=disabled \
+            -Dinstall-mesa-clc=false \
+            -Dinstall-precomp-compiler=false \
+            -Dlibunwind=disabled \
+            -Dlmsensors=disabled \
+            -Dllvm=enabled \
+            -Dmesa-clc=enabled \
+            -Dopengl=false \
+            -Dpanfrost-kmds=kbase \
+            -Dpanfrost-rust=false \
+            -Dplatforms=x11 \
+            -Dprecomp-compiler=enabled \
+            -Dshared-glapi=disabled \
+            -Dtools= \
+            -Dvalgrind=disabled \
+            -Dvideo-codecs= \
+            -Dvulkan-drivers=panfrost \
+            -Dvulkan-layers= \
+            -Dxmlconfig=disabled \
+            -Dzstd=disabled
+          meson compile -C build-noble -j "$(nproc)"
+
+      - name: Package runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/lib artifact/share/vulkan/icd.d
+          install -m755 build-noble/src/panfrost/vulkan/libvulkan_panfrost.so \
+            artifact/lib/libvulkan_panfrost_kbase.so
+          strip --strip-unneeded artifact/lib/libvulkan_panfrost_kbase.so
+          python3 - \
+            build-noble/src/panfrost/vulkan/panfrost_icd.aarch64.json \
+            artifact/share/vulkan/icd.d/panfrost_kbase_icd.aarch64.json <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              manifest = json.load(source)
+          manifest["ICD"]["library_path"] = "/opt/udroid/panvk/lib/libvulkan_panfrost_kbase.so"
+          with open(sys.argv[2], "w", encoding="utf-8") as output:
+              json.dump(manifest, output, indent=4)
+              output.write("\n")
+          PY
+          sha256sum artifact/lib/libvulkan_panfrost_kbase.so > artifact/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panvk-noble-arm64-${{ github.sha }}
+          path: artifact
+          if-no-files-found: error
+          retention-days: 7
