@@ -4,6 +4,10 @@ This document records reproducible facts needed to support the Mali-G78 in
 Google Tensor G1 with an open Mesa driver. It is an engineering ledger, not a
 claim of conformance or support for every Mali-G78 implementation.
 
+The maintained work order and release gates are in the
+[Tensor G1 driver roadmap](tensor-g1-gpu-roadmap.md). This ledger records
+evidence; the roadmap decides what that evidence is sufficient to claim.
+
 ## Evidence rules
 
 Each finding must be marked as one of:
@@ -121,17 +125,69 @@ scans were clean.
 **Observed:** PanVK did not diverge from the stock driver in the image or draw-
 state probes, so no driver patch was needed for these checkpoints.
 
+**Observed:** on the same Pixel 6a snapshot, the focused Android Vulkan CTS
+harness passed `alpha_to_one` with 1, 4, and 8 samples and
+`clip_distance.vert.1` through `.8`. Separate boundary runs passed explicit
+fragment reads for clip-distance counts 1, 5, and 8. The repeated 11-case run
+used APK SHA-256
+`531cd0e80214b4202530ac31466c5d18fe6c02097f626ae027a4bf048800f05d`
+and case-list SHA-256
+`cb6b7064965dae5f0b3f27449e06dfb5e17833b66cf0daad9c3dc516166bd291`.
+These focused passes support the current feature checkpoint; they do not replace
+complete clipping and multisample CTS coverage.
+
 The cache operations follow the requirements in the
 [Vulkan specification](https://registry.khronos.org/vulkan/specs/latest-ratified/pdf/vkspec.pdf):
 host writes to non-coherent memory are flushed before device access, and device
 writes are invalidated before host comparison.
 
+## PRoot X11 presentation boundary
+
+Observed on 2026-10-17 using Pixel 6a build
+`google/bluejay/bluejay:17/CP3A.261005.002.A1/16269273:user/release-keys`,
+kernel `6.1.162-android14-11-g9dd05ae3a1de-ab16261587`, and frozen PanVK ICD
+SHA-256
+`a29c14232a3b8b0c1e3eb5ed67bd6b986f55aac30904d657889b8f3b0ca761cd`:
+
+- `/dev/dma_heap/system` was readable but not writable by the application
+  domain (`cr--r--r--`, owner `system:system`). Opening it with `O_RDWR`
+  failed before the allocation ioctl; `O_RDONLY` allowed the ioctl to return
+  DMA-BUF file descriptors with the requested access mode.
+- Matched offscreen triangle runs ruled out a universal JM throughput limit.
+  Stock measured 694.028, 548.536, and 542.463 frames/s; PanVK measured
+  1163.697, 1902.255, and 1750.726 frames/s after an identical warm-up, with
+  identical shaders and output hash.
+- A four-way 640 by 480 XCB probe isolated two independent requirements. The
+  unmodified path used shared-memory presentation and measured 266 frames/s.
+  DMA-heap access alone created four heap buffers and four kbase imports but
+  failed the redundant implicit-sync import with `EINVAL`. Suppressing only
+  that import retained the shared-memory path at 259 frames/s. Combining both
+  behaviors used four heap buffers and four kbase imports and measured 1305
+  frames/s.
+- The same behavioral combination completed all seven one-second fullscreen
+  `vkmark` scenes at aggregate score 982, compared with 135 on the shared-
+  memory fallback. These short stages were boundary probes, not production
+  benchmark samples.
+
+**Inferred:** the dominant regression in this configuration is the X11 shared-
+memory fallback plus an incompatible redundant sync-file import, not raw JM
+submission throughput. The WSI already waits for the per-image fence before
+queueing presentation when `wait_present_before_queue` is enabled, so creating
+another implicit-sync import is unnecessary on that path.
+
+**Limit:** the four-way comparison used temporary preload behavior against the
+frozen ICD. The source changes have not yet been rebuilt into that exact driver.
+They remain a research checkpoint until the rebuilt binary passes repeated
+resize, move, unmap, image-reuse, present-mode, and lifecycle tests without a
+fault, stale frame, or early presentation.
+
 ## Next probes
 
-1. Stress Android surface recreation and swapchain lifecycle independently of
-   shader correctness.
-2. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
-3. Add performance measurements only after the corresponding correctness gate
+1. Rebuild and repeat the four-way presentation control with the source patch.
+2. Stress Android and X11 surface recreation, image reuse, resize, and lifecycle
+   independently of shader correctness.
+3. Run focused dEQP-VK API, memory, compute, synchronization, and draw groups.
+4. Add performance measurements only after the corresponding correctness gate
    is stable.
 
 Every failed probe should first identify the boundary that diverged from stock.
