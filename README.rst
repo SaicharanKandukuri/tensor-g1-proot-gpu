@@ -14,6 +14,9 @@ arm64 PRoot, chroot, and similar Linux environments which can access
 Build and use
 ~~~~~~~~~~~~~
 
+PanVK Vulkan
+^^^^^^^^^^^^
+
 Start by checking that the Android application domain exposes the GPU node::
 
   $ uname -m
@@ -43,6 +46,99 @@ If the X server does not support the private raw dma-buf transport, use
 ``PANVK_KBASE_DRI3=0`` for the slower MIT-SHM fallback. PRoot cannot bypass
 Android permissions or SELinux; seeing a device node does not guarantee that
 its ioctls are permitted.
+
+Direct Panfrost OpenGL on Tensor G1
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The direct Gallium path is a separate experimental driver for the Tensor G1
+Mali-G78 Job Manager interface. It does not run OpenGL through Zink or PanVK.
+Install the Ubuntu 24.04 build dependencies from the detailed guide above,
+then configure the tested GL, EGL, GLES, and GLX build::
+
+  $ meson setup build-gallium-jm \
+      --buildtype=release \
+      --prefix=/opt/udroid/panfrost-jm \
+      --libdir=lib \
+      -Db_ndebug=true \
+      -Dbuild-tests=false \
+      -Ddisplay-info=disabled \
+      -Degl=enabled \
+      -Degl-native-platform=surfaceless \
+      -Denable-glcpp-tests=false \
+      -Dgallium-drivers=panfrost,softpipe \
+      -Dgbm=enabled \
+      -Dgles1=enabled \
+      -Dgles2=enabled \
+      -Dglvnd=disabled \
+      -Dglx=dri \
+      -Dinstall-mesa-clc=false \
+      -Dinstall-precomp-compiler=false \
+      -Dlibunwind=disabled \
+      -Dlmsensors=disabled \
+      -Dllvm=enabled \
+      -Dmesa-clc=enabled \
+      -Dopengl=true \
+      -Dpanfrost-kmds=panthor,kbase \
+      -Dpanfrost-rust=false \
+      -Dplatforms=x11 \
+      -Dprecomp-compiler=enabled \
+      -Dtools= \
+      -Dvalgrind=disabled \
+      -Dvideo-codecs= \
+      -Dvulkan-drivers= \
+      -Dvulkan-layers= \
+      -Dxmlconfig=disabled \
+      -Dzstd=disabled
+  $ meson compile -C build-gallium-jm -j "$(nproc)"
+  $ meson install -C build-gallium-jm
+
+Use the matching libraries and explicitly opt in to the Kbase JM path::
+
+  $ export DISPLAY=unix/:0
+  $ export PAN_EXPERIMENTAL_KBASE_GL=1
+  $ export LD_LIBRARY_PATH=/opt/udroid/panfrost-jm/lib:/usr/lib/aarch64-linux-gnu
+  $ export LIBGL_DRIVERS_PATH=/opt/udroid/panfrost-jm/lib/dri
+  $ export MESA_LOADER_DRIVER_OVERRIDE=panfrost
+  $ unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+  $ glxinfo -B
+  $ glxgears
+
+``glxinfo -B`` must report ``Mali-G78 MC20 (Panfrost)`` rather than softpipe
+or llvmpipe. The current X11 bridge reads completed GPU resources back to the
+CPU and sends them through the normal X11 image path, so it is a correctness
+checkpoint rather than the final low-copy presentation design.
+
+Runtime flags
+^^^^^^^^^^^^^
+
+``PAN_EXPERIMENTAL_KBASE_GL=1``
+  Enable the direct Tensor G1 JM Gallium path.
+``MESA_LOADER_DRIVER_OVERRIDE``
+  Use ``panfrost`` for direct GL or ``zink`` for OpenGL over PanVK; do not
+  combine the paths.
+``PAN_MESA_DEBUG=sync``
+  Wait for every Panfrost job and report faults; use for diagnosis, not
+  performance testing.
+``VK_DRIVER_FILES=/path.json``
+  Select only the requested PanVK Vulkan ICD.
+``PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1``
+  Required opt-in for non-conformant PanVK.
+``WSI_X11_TERMUX=1``
+  Prefer the Termux:X11 raw dma-buf WSI.
+``PANVK_KBASE_DRI3=raw``
+  Explicitly select raw dma-buf presentation.
+``PANVK_KBASE_DRI3=0``
+  Force the slower MIT-SHM compatibility path.
+``PANVK_KBASE_DMA_HEAP=/path``
+  Override ``/dev/dma_heap/system``.
+``PAN_USE_KRAID=all``
+  Select KRAID for supported shader stages when the build includes it.
+``PANVK_DEBUG=kbase_diag``
+  Enable expensive PanVK Kbase hang diagnostics.
+
+The detailed guide documents every supported switch, fallback, required mount,
+and the global DVFS controls. Internal fault-injection and synchronous-submit
+variables are developer probes and should not be added to normal launchers.
 
 Engineering status and validated hardware are tracked in the
 `Tensor G1 driver roadmap <docs/tensor-g1-gpu-roadmap.md>`_ and
