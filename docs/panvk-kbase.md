@@ -320,6 +320,33 @@ heap:
 export PANVK_KBASE_DMA_HEAP=/dev/dma_heap/system
 ```
 
+## Direct Panfrost GLX presentation
+
+The direct Gallium Panfrost path uses `PAN_KBASE_GL_DRI3=1` to replace its
+CPU-readback window bridge with the DRI3 loader. Client render buffers use the
+private raw dma-buf modifier `1274`, skip DRI3 shared-memory fences, and wait for
+GPU completion before Present. The X server must implement the matching raw-fd
+transport.
+
+X11 compositors also depend on `GLX_EXT_texture_from_pixmap`: KWin renders each
+redirected window or panel into a server-owned pixmap and asks Mesa to bind that
+pixmap as a texture. The compatible uDroid Lorie patch exports both raw-fd and
+AHardwareBuffer-backed pixmaps through `BufferFromPixmap`. Mesa imports the
+returned DMA-BUF directly; only an unexportable pixmap falls back to
+`XGetImage`.
+
+This separation matters when diagnosing desktop behavior:
+
+- window swap presentation tests the client-created modifier-1274 path;
+- panel, launcher, and redirected-window composition test server-pixmap export
+  plus texture-from-pixmap import; and
+- a working `glxgears` window does not prove the compositor path works.
+
+Set `PAN_RAW_TFP_TRACE=1` only for bounded diagnostics. It reports DRI3 protocol
+errors, imported extents and strides, and content checksums at each import
+boundary. The checksum scans map whole images and are intentionally too
+expensive for normal desktop use.
+
 ## Kernel panic warning
 
 > **Warning:** Running the proprietary kbase driver from chroot, proot,

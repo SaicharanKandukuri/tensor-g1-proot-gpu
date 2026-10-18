@@ -758,6 +758,12 @@ bind_extensions(struct glx_screen *psc, const char *driverName)
       // for zink this needs to check whether RELAXED is available
       if (psc->display->driver == GLX_DRIVER_DRI3)
          __glXEnableDirectExtension(psc, "GLX_EXT_swap_control_tear");
+   } else if (psc->driScreen.setSwapInterval) {
+      __glXEnableDirectExtension(psc, "GLX_EXT_swap_control");
+      __glXEnableDirectExtension(psc, "GLX_SGI_swap_control");
+      __glXEnableDirectExtension(psc, "GLX_MESA_swap_control");
+      __glXEnableDirectExtension(psc, "GLX_OML_sync_control");
+      __glXEnableDirectExtension(psc, "GLX_SGI_video_sync");
    }
    if (psc->display->driver != GLX_DRIVER_ZINK_YES)
       __glXEnableDirectExtension(psc, "GLX_MESA_copy_sub_buffer");

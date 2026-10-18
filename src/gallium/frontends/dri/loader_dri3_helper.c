@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <X11/xshmfence.h>
 #include <xcb/xcb.h>
@@ -247,25 +249,31 @@ loader_dri3_blit_image(struct loader_dri3_drawable *draw,
 static inline void
 dri3_fence_reset(xcb_connection_t *c, struct loader_dri3_buffer *buffer)
 {
-   xshmfence_reset(buffer->shm_fence);
+   if (buffer->shm_fence)
+      xshmfence_reset(buffer->shm_fence);
 }
 
 static inline void
 dri3_fence_set(struct loader_dri3_buffer *buffer)
 {
-   xshmfence_trigger(buffer->shm_fence);
+   if (buffer->shm_fence)
+      xshmfence_trigger(buffer->shm_fence);
 }
 
 static inline void
 dri3_fence_trigger(xcb_connection_t *c, struct loader_dri3_buffer *buffer)
 {
-   xcb_sync_trigger_fence(c, buffer->sync_fence);
+   if (buffer->sync_fence)
+      xcb_sync_trigger_fence(c, buffer->sync_fence);
 }
 
 static inline void
 dri3_fence_await(xcb_connection_t *c, struct loader_dri3_drawable *draw,
                  struct loader_dri3_buffer *buffer)
 {
+   if (!buffer->shm_fence)
+      return;
+
    xcb_flush(c);
    xshmfence_await(buffer->shm_fence);
    if (draw) {
@@ -343,8 +351,10 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
 
    if (buffer->own_pixmap)
       xcb_free_pixmap(draw->conn, buffer->pixmap);
-   xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
-   xshmfence_unmap_shm(buffer->shm_fence);
+   if (buffer->sync_fence)
+      xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
+   if (buffer->shm_fence)
+      xshmfence_unmap_shm(buffer->shm_fence);
    dri2_destroy_image(buffer->image);
    if (buffer->linear_buffer)
       dri2_destroy_image(buffer->linear_buffer);
@@ -1168,7 +1178,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       back->busy = 1;
       back->last_swap = draw->send_sbc;
 
-      if (!draw->region) {
+      if (!draw->use_raw_fd_modifier && !draw->region) {
          draw->region = xcb_generate_id(draw->conn);
          xcb_xfixes_create_region(draw->conn, draw->region, 0, NULL);
       }
@@ -1176,7 +1186,8 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       xcb_xfixes_region_t region = 0;
       xcb_rectangle_t xcb_rects[64];
 
-      if (n_rects > 0 && n_rects <= ARRAY_SIZE(xcb_rects)) {
+      if (!draw->use_raw_fd_modifier &&
+          n_rects > 0 && n_rects <= ARRAY_SIZE(xcb_rects)) {
          for (int i = 0; i < n_rects; i++) {
             const int *rect = &rects[i * 4];
             xcb_rects[i].x = rect[0];
@@ -1422,7 +1433,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    xcb_pixmap_t pixmap;
    xcb_sync_fence_t sync_fence;
    struct xshmfence *shm_fence;
-   int buffer_fds[4], fence_fd;
+   int buffer_fds[4], fence_fd = -1;
    int num_planes = 0;
    uint64_t *modifiers = NULL;
    uint32_t count = 0;
@@ -1433,13 +1444,17 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
     * prepare to send that to the X server
     */
 
-   fence_fd = xshmfence_alloc_shm();
-   if (fence_fd < 0)
-      return NULL;
+   shm_fence = NULL;
+   sync_fence = 0;
+   if (!draw->use_raw_fd_modifier) {
+      fence_fd = xshmfence_alloc_shm();
+      if (fence_fd < 0)
+         return NULL;
 
-   shm_fence = xshmfence_map_shm(fence_fd);
-   if (shm_fence == NULL)
-      goto no_shm_fence;
+      shm_fence = xshmfence_map_shm(fence_fd);
+      if (shm_fence == NULL)
+         goto no_shm_fence;
+   }
 
    /* Allocate the image from the driver
     */
@@ -1452,7 +1467,13 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
       goto no_image;
 
    if (draw->dri_screen_render_gpu == draw->dri_screen_display_gpu) {
-      if (draw->multiplanes_available && draw->dri_screen_render_gpu->base.screen->resource_create_with_modifiers) {
+      if (draw->use_raw_fd_modifier) {
+         modifiers = malloc(sizeof(*modifiers));
+         if (!modifiers)
+            goto no_image;
+         modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+         count = 1;
+      } else if (draw->multiplanes_available && draw->dri_screen_render_gpu->base.screen->resource_create_with_modifiers) {
          xcb_dri3_get_supported_modifiers_cookie_t mod_cookie;
          xcb_dri3_get_supported_modifiers_reply_t *mod_reply;
          xcb_generic_error_t *error = NULL;
@@ -1625,7 +1646,18 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    pixmap = xcb_generate_id(draw->conn);
 
    xcb_void_cookie_t cookie_pix, cookie_fence;
-   if (draw->multiplanes_available &&
+   if (draw->use_raw_fd_modifier) {
+      assert(num_planes == 1);
+      cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,
+                                                        pixmap,
+                                                        draw->window,
+                                                        1,
+                                                        width, height,
+                                                        buffer->strides[0], buffer->offsets[0],
+                                                        0, 0, 0, 0, 0, 0,
+                                                        depth, buffer->cpp * 8,
+                                                        1274, buffer_fds);
+   } else if (draw->multiplanes_available &&
        buffer->modifier != DRM_FORMAT_MOD_INVALID) {
       cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,
                                                         pixmap,
@@ -1648,15 +1680,17 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                                                        depth, buffer->cpp * 8,
                                                        buffer_fds[0]);
    }
-   cookie_fence = xcb_dri3_fence_from_fd_checked(draw->conn,
-                                                 pixmap,
-                                                 (sync_fence = xcb_generate_id(draw->conn)),
-                                                 false,
-                                                 fence_fd);
+   if (!draw->use_raw_fd_modifier)
+      cookie_fence = xcb_dri3_fence_from_fd_checked(draw->conn,
+                                                    pixmap,
+                                                    (sync_fence = xcb_generate_id(draw->conn)),
+                                                    false,
+                                                    fence_fd);
    /* Group error checking to limit round-trips. */
    if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]"))
       goto no_buffer_attrib;
-   if (!check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
+   if (!draw->use_raw_fd_modifier &&
+       !check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
       goto no_buffer_attrib;
 
    buffer->pixmap = pixmap;
@@ -1684,9 +1718,11 @@ no_linear_buffer:
 no_image:
    free(buffer);
 no_buffer:
-   xshmfence_unmap_shm(shm_fence);
+   if (shm_fence)
+      xshmfence_unmap_shm(shm_fence);
 no_shm_fence:
-   close(fence_fd);
+   if (fence_fd >= 0)
+      close(fence_fd);
    return NULL;
 }
 
@@ -1830,6 +1866,41 @@ loader_dri3_create_image(xcb_connection_t *c,
    stride = bp_reply->stride;
    offset = 0;
 
+   if (getenv("PAN_RAW_TFP_TRACE")) {
+      struct stat st;
+      const int stat_ret = fstat(fds[0], &st);
+      const size_t span = (size_t)stride * bp_reply->height;
+      const size_t map_size = stat_ret == 0 && st.st_size > 0
+                                 ? (size_t)st.st_size : span;
+      void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fds[0], 0);
+      uint32_t crc = ~0u;
+      unsigned nonzero = 0;
+
+      if (map != MAP_FAILED) {
+         const uint8_t *bytes = map;
+         const size_t inspect = MIN2(span, map_size);
+         for (size_t i = 0; i < inspect; i++) {
+            crc ^= bytes[i];
+            nonzero += bytes[i] != 0;
+            for (unsigned bit = 0; bit < 8; bit++)
+               crc = (crc >> 1) ^
+                     (0xedb88320u & -(int32_t)(crc & 1));
+         }
+         crc = ~crc;
+         munmap(map, map_size);
+      } else {
+         crc = 0;
+      }
+
+      mesa_logi("dri3-pixmap-reply single fd=%d extent=%ux%u stride=%d "
+                "reply-size=%u stat-size=%lld span=%llu crc=%08x "
+                "nonzero=%u",
+                fds[0], bp_reply->width, bp_reply->height, stride,
+                bp_reply->size,
+                stat_ret == 0 ? (long long)st.st_size : -1ll,
+                (unsigned long long)span, crc, nonzero);
+   }
+
    /* createImageFromDmaBufs creates a wrapper struct dri_image structure which
     * can deal with multiple planes for things like Yuv images. So, once
     * we've gotten the planar wrapper, pull the single plane out of it and
@@ -1883,6 +1954,45 @@ loader_dri3_create_image_from_buffers(xcb_connection_t *c,
       offsets[i] = offsets_in[i];
    }
 
+   if (getenv("PAN_RAW_TFP_TRACE")) {
+      for (i = 0; i < bp_reply->nfd; i++) {
+         struct stat st;
+         const int stat_ret = fstat(fds[i], &st);
+         const size_t span = (size_t)strides[i] * bp_reply->height;
+         const size_t map_size = stat_ret == 0 && st.st_size > 0
+                                    ? (size_t)st.st_size : span;
+         void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fds[i], 0);
+         uint32_t crc = ~0u;
+         unsigned nonzero = 0;
+
+         if (map != MAP_FAILED) {
+            const uint8_t *bytes = map;
+            const size_t inspect = MIN2(span, map_size);
+            for (size_t j = 0; j < inspect; j++) {
+               crc ^= bytes[j];
+               nonzero += bytes[j] != 0;
+               for (unsigned bit = 0; bit < 8; bit++)
+                  crc = (crc >> 1) ^
+                        (0xedb88320u & -(int32_t)(crc & 1));
+            }
+            crc = ~crc;
+            munmap(map, map_size);
+         } else {
+            crc = 0;
+         }
+
+         mesa_logi("dri3-pixmap-reply plane=%d nfd=%u fd=%d "
+                   "extent=%ux%u stride=%d offset=%d modifier=0x%llx "
+                   "stat-size=%lld span=%llu crc=%08x "
+                   "nonzero=%u",
+                   i, bp_reply->nfd, fds[i], bp_reply->width,
+                   bp_reply->height, strides[i], offsets[i],
+                   (unsigned long long)bp_reply->modifier,
+                   stat_ret == 0 ? (long long)st.st_size : -1ll,
+                   (unsigned long long)span, crc, nonzero);
+      }
+   }
+
    ret = dri2_from_dma_bufs(dri_screen,
                                        bp_reply->width,
                                        bp_reply->height,
@@ -1908,12 +2018,23 @@ loader_dri3_get_pixmap_buffer(xcb_connection_t *conn, xcb_drawable_t pixmap, str
    if (multiplanes_available) {
       xcb_dri3_buffers_from_pixmap_cookie_t bps_cookie;
       xcb_dri3_buffers_from_pixmap_reply_t *bps_reply;
+      xcb_generic_error_t *error = NULL;
 
       bps_cookie = xcb_dri3_buffers_from_pixmap(conn, pixmap);
       bps_reply = xcb_dri3_buffers_from_pixmap_reply(conn, bps_cookie,
-                                                     NULL);
-      if (!bps_reply)
+                                                     &error);
+      if (!bps_reply) {
+         if (getenv("PAN_RAW_TFP_TRACE"))
+            mesa_logi("dri3-pixmap-reply failed pixmap=0x%x request=buffers "
+                      "error=%u major=%u minor=%u sequence=%u",
+                      pixmap, error ? error->error_code : 0,
+                      error ? error->major_code : 0,
+                      error ? error->minor_code : 0,
+                      error ? error->sequence : 0);
+         free(error);
          return NULL;
+      }
+      free(error);
       image = loader_dri3_create_image_from_buffers(conn, bps_reply, fourcc,
                                                     screen, loader_data);
       *width = bps_reply->width;
@@ -1922,11 +2043,22 @@ loader_dri3_get_pixmap_buffer(xcb_connection_t *conn, xcb_drawable_t pixmap, str
    } else {
       xcb_dri3_buffer_from_pixmap_cookie_t bp_cookie;
       xcb_dri3_buffer_from_pixmap_reply_t *bp_reply;
+      xcb_generic_error_t *error = NULL;
 
       bp_cookie = xcb_dri3_buffer_from_pixmap(conn, pixmap);
-      bp_reply = xcb_dri3_buffer_from_pixmap_reply(conn, bp_cookie, NULL);
-      if (!bp_reply)
+      bp_reply = xcb_dri3_buffer_from_pixmap_reply(conn, bp_cookie, &error);
+      if (!bp_reply) {
+         if (getenv("PAN_RAW_TFP_TRACE"))
+            mesa_logi("dri3-pixmap-reply failed pixmap=0x%x request=buffer "
+                      "error=%u major=%u minor=%u sequence=%u",
+                      pixmap, error ? error->error_code : 0,
+                      error ? error->major_code : 0,
+                      error ? error->minor_code : 0,
+                      error ? error->sequence : 0);
+         free(error);
          return NULL;
+      }
+      free(error);
 
       image = loader_dri3_create_image(conn, bp_reply, fourcc, screen,
                                                loader_data);
@@ -1972,7 +2104,7 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
       goto no_fence;
    shm_fence = xshmfence_map_shm(fence_fd);
    if (shm_fence == NULL) {
-      close (fence_fd);
+      close(fence_fd);
       goto no_fence;
    }
 

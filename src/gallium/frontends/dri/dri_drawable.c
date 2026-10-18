@@ -35,12 +35,73 @@
 
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
+#include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/u_inlines.h"
+#include "util/log.h"
 
 #include "state_tracker/st_context.h"
 
 static uint32_t drifb_ID = 0;
+
+static uint32_t
+dri_tfp_trace_crc32(uint32_t crc, const uint8_t *data, size_t size)
+{
+   crc = ~crc;
+   for (size_t i = 0; i < size; i++) {
+      crc ^= data[i];
+      for (unsigned bit = 0; bit < 8; bit++)
+         crc = (crc >> 1) ^ (0xedb88320u & -(int32_t)(crc & 1));
+   }
+   return ~crc;
+}
+
+static void
+dri_trace_tfp_resource(struct dri_context *ctx,
+                       struct dri_drawable *drawable,
+                       struct pipe_resource *resource)
+{
+   if (!debug_get_bool_option("PAN_RAW_TFP_TRACE", false))
+      return;
+
+   struct pipe_context *pipe = ctx->st->pipe;
+   struct pipe_transfer *transfer = NULL;
+   const unsigned width = resource->width0;
+   const unsigned height = resource->height0;
+   const unsigned row_bytes = width * util_format_get_blocksize(resource->format);
+   uint8_t *map = pipe_texture_map(pipe, resource, 0, 0, PIPE_MAP_READ,
+                                   0, 0, width, height, &transfer);
+   if (!map) {
+      mesa_loge("tfp-resource drawable=%p resource=%p map_failed "
+                "extent=%ux%u format=%s bind=0x%x",
+                (void *)drawable, (void *)resource, width, height,
+                util_format_short_name(resource->format), resource->bind);
+      return;
+   }
+
+   uint32_t crc = 0;
+   unsigned nonzero = 0;
+   for (unsigned y = 0; y < height; y++) {
+      const uint8_t *row = map + (size_t)y * transfer->stride;
+      crc = dri_tfp_trace_crc32(crc, row, row_bytes);
+      for (unsigned x = 0; x < row_bytes; x++)
+         nonzero += row[x] != 0;
+   }
+
+   const unsigned center_offset =
+      MIN2((width / 2) * util_format_get_blocksize(resource->format),
+           transfer->stride - 4);
+   const uint8_t *center =
+      map + (size_t)(height / 2) * transfer->stride + center_offset;
+   mesa_logi("tfp-resource drawable=%p resource=%p extent=%ux%u format=%s "
+             "bind=0x%x stride=%u crc=%08x nonzero=%u "
+             "center=%02x%02x%02x%02x",
+             (void *)drawable, (void *)resource, width, height,
+             util_format_short_name(resource->format), resource->bind,
+             transfer->stride, crc, nonzero,
+             center[0], center[1], center[2], center[3]);
+   pipe_texture_unmap(pipe, transfer);
+}
 
 static bool
 dri_st_framebuffer_validate(struct st_context *st,
@@ -281,6 +342,8 @@ dri_set_tex_buffer2(struct dri_context *ctx, GLint target,
 
    if (pt) {
       enum pipe_format internal_format = pt->format;
+
+      dri_trace_tfp_resource(ctx, drawable, pt);
 
       if (format == __DRI_TEXTURE_FORMAT_RGB)  {
          /* only need to cover the formats recognized by dri_fill_st_visual */

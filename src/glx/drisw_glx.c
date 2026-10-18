@@ -37,12 +37,15 @@
 #endif
 #include <X11/extensions/shmproto.h>
 #include <assert.h>
+#include <limits.h>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_xcb.h>
 #include "util/u_debug.h"
 #include "util/log.h"
 #include "kopper_interface.h"
 #include "loader_dri_helper.h"
+#include "dri_drawable.h"
+#include "dri_screen.h"
 #include "dri_util.h"
 #include "mesa/glapi/glapi/glapi.h"
 #include "dispatch.h"
@@ -50,6 +53,24 @@
 
 static int xshm_error = 0;
 static int xshm_opcode = -1;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+static const __DRIimageLoaderExtension rawDri3ImageLoaderExtension;
+#endif
+
+static struct drisw_drawable *
+drisw_loader_to_drawable(struct dri_drawable *draw, void *loader_private)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (draw->screen->image.loader == &rawDri3ImageLoaderExtension &&
+       draw->is_window) {
+      struct loader_dri3_drawable *loader_drawable = loader_private;
+      return container_of(loader_drawable, struct drisw_drawable,
+                          loader_drawable);
+   }
+#endif
+   return loader_private;
+}
 
 /**
  * Catches potential Xlib errors.
@@ -150,7 +171,8 @@ get_drawable_geometry(struct dri_drawable * draw,
                       int *x, int *y, int *w, int *h,
                       void *loaderPrivate)
 {
-   struct drisw_drawable *pdp = loaderPrivate;
+   struct drisw_drawable *pdp =
+      drisw_loader_to_drawable(draw, loaderPrivate);
    __GLXDRIdrawable *pdraw = &(pdp->base);
    Display *dpy = pdraw->psc->dpy;
    Drawable drawable;
@@ -202,7 +224,8 @@ swrastXPutImage(struct dri_drawable * draw, int op,
                 int w, int h, int stride,
                 int shmid, char *data, void *loaderPrivate)
 {
-   struct drisw_drawable *pdp = loaderPrivate;
+   struct drisw_drawable *pdp =
+      drisw_loader_to_drawable(draw, loaderPrivate);
    __GLXDRIdrawable *pdraw = &(pdp->base);
    Display *dpy = pdraw->psc->dpy;
    Drawable drawable;
@@ -237,7 +260,8 @@ swrastPutImageShm(struct dri_drawable * draw, int op,
                   int shmid, char *shmaddr, unsigned offset,
                   void *loaderPrivate)
 {
-   struct drisw_drawable *pdp = loaderPrivate;
+   struct drisw_drawable *pdp =
+      drisw_loader_to_drawable(draw, loaderPrivate);
 
    if (!pdp)
       return;
@@ -254,7 +278,8 @@ swrastPutImageShm2(struct dri_drawable * draw, int op,
                    int shmid, char *shmaddr, unsigned offset,
                    void *loaderPrivate)
 {
-   struct drisw_drawable *pdp = loaderPrivate;
+   struct drisw_drawable *pdp =
+      drisw_loader_to_drawable(draw, loaderPrivate);
 
    if (!pdp)
       return;
@@ -293,7 +318,8 @@ swrastGetImage2(struct dri_drawable * read,
                 int x, int y, int w, int h, int stride,
                 char *data, void *loaderPrivate)
 {
-   struct drisw_drawable *prp = loaderPrivate;
+   struct drisw_drawable *prp =
+      drisw_loader_to_drawable(read, loaderPrivate);
    __GLXDRIdrawable *pread = &(prp->base);
    Display *dpy = pread->psc->dpy;
    Drawable readable;
@@ -330,7 +356,8 @@ swrastGetImageShm2(struct dri_drawable * read,
                    int x, int y, int w, int h,
                    int shmid, void *loaderPrivate)
 {
-   struct drisw_drawable *prp = loaderPrivate;
+   struct drisw_drawable *prp =
+      drisw_loader_to_drawable(read, loaderPrivate);
    __GLXDRIdrawable *pread = &(prp->base);
    Display *dpy = pread->psc->dpy;
    Drawable readable;
@@ -387,6 +414,131 @@ static const __DRIswrastLoaderExtension swrastLoaderExtension = {
    .getImage2           = swrastGetImage2,
 };
 
+#ifdef HAVE_PAN_KMOD_KBASE
+static void
+raw_dri3_set_drawable_size(struct loader_dri3_drawable *draw,
+                           int width, int height)
+{
+   (void)draw;
+   (void)width;
+   (void)height;
+}
+
+static bool
+raw_dri3_in_current_context(struct loader_dri3_drawable *draw)
+{
+   struct drisw_drawable *pdp =
+      container_of(draw, struct drisw_drawable, loader_drawable);
+   struct glx_context *gc = __glXGetCurrentContext();
+
+   return gc != &dummyContext && gc->psc == pdp->base.psc;
+}
+
+static struct dri_context *
+raw_dri3_get_dri_context(struct loader_dri3_drawable *draw)
+{
+   struct glx_context *gc = __glXGetCurrentContext();
+
+   return gc != &dummyContext ? gc->driContext : NULL;
+}
+
+static struct dri_screen *
+raw_dri3_get_dri_screen(void)
+{
+   struct glx_context *gc = __glXGetCurrentContext();
+
+   return gc != &dummyContext ? gc->psc->frontend_screen : NULL;
+}
+
+static void
+raw_dri3_flush_drawable(struct loader_dri3_drawable *draw, unsigned flags)
+{
+   loader_dri3_flush(draw, flags, __DRI2_THROTTLE_SWAPBUFFER);
+}
+
+static int
+raw_dri3_get_buffers(struct dri_drawable *dri_drawable,
+                     unsigned int format, uint32_t *stamp,
+                     void *loader_private, uint32_t buffer_mask,
+                     struct __DRIimageList *buffers)
+{
+   if (!dri_drawable->is_window)
+      return 0;
+
+   return loader_dri3_get_buffers(dri_drawable, format, stamp,
+                                  loader_private, buffer_mask, buffers);
+}
+
+static void
+raw_dri3_update_tex_buffer(struct dri_drawable *drawable,
+                           struct dri_context *ctx,
+                           struct pipe_resource *resource)
+{
+   struct loader_dri3_drawable *loader_drawable = drawable->loaderPrivate;
+   struct drisw_drawable *pdp =
+      container_of(loader_drawable, struct drisw_drawable, loader_drawable);
+   struct loader_dri3_buffer *front =
+      loader_drawable->buffers[LOADER_DRI3_FRONT_ID];
+
+   /*
+    * A server-owned pixmap is normally imported directly and already backs
+    * the texture passed here.  Some X11 pixmaps cannot be exported through
+    * DRI3, though.  drisw_allocate_textures() then creates a local fallback
+    * resource, which still needs the ordinary XGetImage upload path.
+    */
+   if (front && front->image && front->image->texture == resource)
+      return;
+
+   if (debug_get_bool_option("PAN_RAW_TFP_TRACE", false))
+      mesa_logi("raw-dri3 TFP falling back to XGetImage drawable=0x%x "
+                "extent=%ux%u",
+                loader_drawable->drawable, resource->width0,
+                resource->height0);
+
+   pdp->raw_dri3_fallback_update_tex_buffer(drawable, ctx, resource);
+}
+
+static const struct loader_dri3_vtable raw_dri3_vtable = {
+   .set_drawable_size = raw_dri3_set_drawable_size,
+   .in_current_context = raw_dri3_in_current_context,
+   .get_dri_context = raw_dri3_get_dri_context,
+   .get_dri_screen = raw_dri3_get_dri_screen,
+   .flush_drawable = raw_dri3_flush_drawable,
+};
+
+static void
+raw_dri3_flush_front_buffer(struct dri_drawable *dri_drawable,
+                            void *loader_private)
+{
+   if (!dri_drawable->is_window)
+      return;
+
+   struct loader_dri3_drawable *draw = loader_private;
+
+   loader_dri3_flush(draw, __DRI2_FLUSH_DRAWABLE,
+                     __DRI2_THROTTLE_FLUSHFRONT);
+   dri_invalidate_drawable(dri_drawable);
+   loader_dri3_wait_gl(draw);
+}
+
+static void
+raw_dri3_flush_swap_buffers(struct dri_drawable *dri_drawable,
+                            void *loader_private)
+{
+   if (!dri_drawable->is_window)
+      return;
+
+   loader_dri3_swapbuffer_barrier(loader_private);
+}
+
+static const __DRIimageLoaderExtension rawDri3ImageLoaderExtension = {
+   .base = { __DRI_IMAGE_LOADER, 3 },
+   .getBuffers = raw_dri3_get_buffers,
+   .flushFrontBuffer = raw_dri3_flush_front_buffer,
+   .flushSwapBuffers = raw_dri3_flush_swap_buffers,
+};
+#endif
+
 static_assert(sizeof(struct kopper_vk_surface_create_storage) >= sizeof(VkXcbSurfaceCreateInfoKHR), "");
 
 static void
@@ -430,6 +582,14 @@ static const __DRIextension *loader_extensions_noshm[] = {
    NULL
 };
 
+#ifdef HAVE_PAN_KMOD_KBASE
+static const __DRIextension *loader_extensions_raw_dri3[] = {
+   &swrastLoaderExtension.base,
+   &rawDri3ImageLoaderExtension.base,
+   NULL
+};
+#endif
+
 static const __DRIextension *kopper_extensions_noshm[] = {
    &swrastLoaderExtension.base,
    &kopperLoaderExtension.base,
@@ -444,12 +604,30 @@ static const __DRIextension *kopper_extensions_noshm[] = {
 static void
 drisw_wait_gl(struct glx_context *context)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)
+      GetGLXDRIDrawable(context->currentDpy, context->currentDrawable);
+
+   if (pdp && pdp->raw_dri3) {
+      loader_dri3_wait_gl(&pdp->loader_drawable);
+      return;
+   }
+#endif
    CALL_Finish(GET_DISPATCH(), ());
 }
 
 static void
 drisw_wait_x(struct glx_context *context)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)
+      GetGLXDRIDrawable(context->currentDpy, context->currentDrawable);
+
+   if (pdp && pdp->raw_dri3) {
+      loader_dri3_wait_x(&pdp->loader_drawable);
+      return;
+   }
+#endif
    XSync(context->currentDpy, False);
 }
 
@@ -476,7 +654,12 @@ driswDestroyDrawable(__GLXDRIdrawable * pdraw)
 {
    struct drisw_drawable *pdp = (struct drisw_drawable *) pdraw;
 
-   driDestroyDrawable(pdp->base.dri_drawable);
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (pdp->raw_dri3)
+      loader_dri3_drawable_fini(&pdp->loader_drawable);
+   else
+#endif
+      driDestroyDrawable(pdp->base.dri_drawable);
 
    XDestroyDrawable(pdp, pdraw->psc->dpy, pdraw->drawable);
    free(pdp);
@@ -536,8 +719,39 @@ driswCreateDrawable(struct glx_screen *base, XID xDrawable,
    }
 
    pdp->swapInterval = dri_get_initial_swap_interval(psc->base.frontend_screen);
-   /* Create a new drawable */
-   pdp->base.dri_drawable = dri_create_drawable(psc->base.frontend_screen, config->driConfig, !(type & GLX_WINDOW_BIT), pdp);
+#ifdef HAVE_PAN_KMOD_KBASE
+   const bool raw_dri3_pixmap = type == GLX_PIXMAP_BIT;
+   pdp->raw_dri3 = psc->raw_dri3 &&
+                   ((type & GLX_WINDOW_BIT) || raw_dri3_pixmap);
+   if (pdp->raw_dri3) {
+      if (loader_dri3_drawable_init(conn, xDrawable,
+                                    raw_dri3_pixmap ?
+                                       LOADER_DRI3_DRAWABLE_PIXMAP :
+                                       LOADER_DRI3_DRAWABLE_WINDOW,
+                                    psc->base.frontend_screen,
+                                    psc->base.frontend_screen,
+                                    !raw_dri3_pixmap, false,
+                                    config->driConfig,
+                                    &raw_dri3_vtable,
+                                    &pdp->loader_drawable)) {
+         XDestroyDrawable(pdp, psc->base.dpy, xDrawable);
+         free(pdp);
+         return NULL;
+      }
+      pdp->loader_drawable.use_raw_fd_modifier = true;
+      pdp->base.dri_drawable = pdp->loader_drawable.dri_drawable;
+      pdp->base.dri_drawable->is_window = true;
+      if (raw_dri3_pixmap) {
+         pdp->raw_dri3_fallback_update_tex_buffer =
+            pdp->base.dri_drawable->update_tex_buffer;
+         pdp->base.dri_drawable->update_tex_buffer =
+            raw_dri3_update_tex_buffer;
+      }
+   } else
+#endif
+      pdp->base.dri_drawable =
+         dri_create_drawable(psc->base.frontend_screen, config->driConfig,
+                             !(type & GLX_WINDOW_BIT), pdp);
    if (psc->kopper)
       kopperSetSwapInterval(pdp->base.dri_drawable, pdp->swapInterval);
 
@@ -559,6 +773,21 @@ driswSwapBuffers(__GLXDRIdrawable * pdraw,
 {
    struct drisw_screen *psc = (struct drisw_screen *) pdraw->psc;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)pdraw;
+   if (pdp->raw_dri3) {
+      unsigned flags = __DRI2_FLUSH_DRAWABLE;
+
+      if (flush)
+         flags |= __DRI2_FLUSH_CONTEXT;
+
+      CALL_Finish(GET_DISPATCH(), ());
+      return loader_dri3_swap_buffers_msc(&pdp->loader_drawable,
+                                           target_msc, divisor, remainder,
+                                           flags, NULL, 0, false);
+   }
+#endif
+
    (void) target_msc;
    (void) divisor;
    (void) remainder;
@@ -579,6 +808,16 @@ static void
 drisw_copy_sub_buffer(__GLXDRIdrawable * pdraw,
                       int x, int y, int width, int height, Bool flush)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)pdraw;
+   if (pdp->raw_dri3) {
+      CALL_Finish(GET_DISPATCH(), ());
+      loader_dri3_copy_sub_buffer(&pdp->loader_drawable, x, y,
+                                  width, height, flush);
+      return;
+   }
+#endif
+
    if (flush) {
       CALL_Flush(GET_DISPATCH(), ());
    }
@@ -595,7 +834,12 @@ driswKopperSetSwapInterval(__GLXDRIdrawable *pdraw, int interval)
    if (!dri_valid_swap_interval(psc->base.frontend_screen, interval))
       return GLX_BAD_VALUE;
 
-   kopperSetSwapInterval(pdp->base.dri_drawable, interval);
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (pdp->raw_dri3)
+      loader_dri3_set_swap_interval(&pdp->loader_drawable, interval);
+   else
+#endif
+      kopperSetSwapInterval(pdp->base.dri_drawable, interval);
    pdp->swapInterval = interval;
 
    return 0;
@@ -613,6 +857,12 @@ static int
 kopperWaitForMSC(__GLXDRIdrawable *pdraw, int64_t target_msc, int64_t divisor,
                  int64_t remainder, int64_t *ust, int64_t *msc, int64_t *sbc)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)pdraw;
+   if (pdp->raw_dri3)
+      return loader_dri3_wait_for_msc(&pdp->loader_drawable, target_msc,
+                                      divisor, remainder, ust, msc, sbc);
+#endif
    return kopperGetSyncValues(pdraw->dri_drawable, target_msc, divisor, remainder, ust, msc, sbc);
 }
 
@@ -620,8 +870,26 @@ static int
 kopperGetDrawableMSC(struct glx_screen *psc, __GLXDRIdrawable *pdraw,
                      int64_t *ust, int64_t *msc, int64_t *sbc)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct drisw_drawable *pdp = (struct drisw_drawable *)pdraw;
+   if (pdp->raw_dri3)
+      return loader_dri3_wait_for_msc(&pdp->loader_drawable, 0, 0, 0,
+                                      ust, msc, sbc);
+#endif
    return kopperGetSyncValues(pdraw->dri_drawable, 0, 0, 0, ust, msc, sbc);
 }
+
+#ifdef HAVE_PAN_KMOD_KBASE
+static int
+rawDri3WaitForSBC(__GLXDRIdrawable *pdraw, int64_t target_sbc, int64_t *ust,
+                  int64_t *msc, int64_t *sbc)
+{
+   struct drisw_drawable *pdp = (struct drisw_drawable *)pdraw;
+
+   return loader_dri3_wait_for_sbc(&pdp->loader_drawable, target_sbc,
+                                   ust, msc, sbc);
+}
+#endif
 
 
 struct glx_screen *
@@ -641,9 +909,17 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
       return NULL;
    psc->kopper = !strcmp(driver, "zink");
    psc->base.driverName = strdup(driver);
+#ifdef HAVE_PAN_KMOD_KBASE
+   psc->raw_dri3 = !psc->kopper && priv->has_multibuffer &&
+                   debug_get_bool_option("PAN_KBASE_GL_DRI3", false);
+#endif
 
    if (glx_driver)
       loader_extensions_local = kopper_extensions_noshm;
+#ifdef HAVE_PAN_KMOD_KBASE
+   else if (psc->raw_dri3)
+      loader_extensions_local = loader_extensions_raw_dri3;
+#endif
    else if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false))
       loader_extensions_local = loader_extensions_noshm;
 #ifdef HAVE_SYS_SHM_H
@@ -669,12 +945,16 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
    if (!glx_driver)
       psp->copySubBuffer = drisw_copy_sub_buffer;
 
-   if (psc->kopper) {
+   if (psc->kopper || psc->raw_dri3) {
       psp->setSwapInterval = driswKopperSetSwapInterval;
       psp->getSwapInterval = kopperGetSwapInterval;
-      psp->maxSwapInterval = 1;
+      psp->maxSwapInterval = psc->raw_dri3 ? INT_MAX : 1;
       psp->getDrawableMSC = kopperGetDrawableMSC;
       psp->waitForMSC = kopperWaitForMSC;
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (psc->raw_dri3)
+         psp->waitForSBC = rawDri3WaitForSBC;
+#endif
    }
 
    return &psc->base;

@@ -1795,6 +1795,27 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
       goto err_free_bo;
    }
 
+   if (getenv("PAN_RAW_TFP_TRACE")) {
+      void *map = mmap(NULL, size, PROT_READ, MAP_SHARED,
+                       kbase_bo->dmabuf_fd, 0);
+      if (map != MAP_FAILED) {
+         const uint8_t *bytes = map;
+         uint32_t crc = ~0u;
+         unsigned nonzero = 0;
+         for (uint64_t i = 0; i < size; i++) {
+            crc ^= bytes[i];
+            nonzero += bytes[i] != 0;
+            for (unsigned bit = 0; bit < 8; bit++)
+               crc = (crc >> 1) ^ (0xedb88320u & -(int32_t)(crc & 1));
+         }
+         mesa_logi("kbase: import-fd pre-ioctl fd=%d size=%llu "
+                   "crc=%08x nonzero=%u first=%02x%02x%02x%02x",
+                   kbase_bo->dmabuf_fd, (unsigned long long)size, ~crc,
+                   nonzero, bytes[0], bytes[1], bytes[2], bytes[3]);
+         munmap(map, size);
+      }
+   }
+
    uint64_t import_flags =
       BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
@@ -1846,6 +1867,22 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
          goto err_unmap_gpu;
       }
       kbase_bo->owns_cpu_mapping = true;
+
+      if (getenv("PAN_RAW_TFP_TRACE")) {
+         const uint8_t *bytes = kbase_bo->cpu_ptr;
+         uint32_t crc = ~0u;
+         unsigned nonzero = 0;
+         for (uint64_t i = 0; i < size; i++) {
+            crc ^= bytes[i];
+            nonzero += bytes[i] != 0;
+            for (unsigned bit = 0; bit < 8; bit++)
+               crc = (crc >> 1) ^ (0xedb88320u & -(int32_t)(crc & 1));
+         }
+         mesa_logi("kbase: import-fd post-ioctl fd=%d size=%llu "
+                   "crc=%08x nonzero=%u first=%02x%02x%02x%02x",
+                   kbase_bo->dmabuf_fd, (unsigned long long)size, ~crc,
+                   nonzero, bytes[0], bytes[1], bytes[2], bytes[3]);
+      }
    }
 
    kbase_bo->gpu_va = (uintptr_t)kbase_bo->gpu_mapping;

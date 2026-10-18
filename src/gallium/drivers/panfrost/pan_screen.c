@@ -687,6 +687,17 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    struct panfrost_device *dev = &screen->dev;
 #ifdef HAVE_PAN_KMOD_KBASE
    bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
+
+   /*
+    * u_init_pipe_screen_caps() discovers PRIME support with drmGetCap().
+    * A kbase fd is deliberately not a DRM fd, so that generic probe cannot
+    * see the dma-buf import/export implemented by the kbase kmod backend.
+    * Advertise it explicitly when the backend has a usable Android dma-heap;
+    * otherwise DRI3 receives valid pixmap fds but refuses them before
+    * resource_from_handle() is reached.
+    */
+   if (kbase_kmod_supports_dmabuf(dev->kmod.dev))
+      caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
 #else
    bool is_kbase_jm = false;
 #endif

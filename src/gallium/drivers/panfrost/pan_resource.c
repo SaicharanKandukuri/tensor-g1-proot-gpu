@@ -9,6 +9,8 @@
  */
 
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <xf86drm.h>
 #include "drm-uapi/drm_fourcc.h"
 
@@ -373,6 +375,43 @@ panfrost_resource_from_handle(struct pipe_screen *pscreen,
    if (!valid) {
       panfrost_resource_destroy(pscreen, &rsc->base);
       return NULL;
+   }
+
+   if (getenv("PAN_RAW_TFP_TRACE")) {
+      struct stat st;
+      const int stat_ret = fstat(whandle->handle, &st);
+      const size_t span = (size_t)whandle->stride * templat->height0;
+      const size_t map_size = stat_ret == 0 && st.st_size > 0
+                                 ? (size_t)st.st_size : span;
+      void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED,
+                       whandle->handle, 0);
+      uint32_t crc = ~0u;
+      unsigned nonzero = 0;
+
+      if (map != MAP_FAILED) {
+         const uint8_t *bytes = map;
+         const size_t inspect = MIN2(span, map_size);
+         for (size_t i = 0; i < inspect; i++) {
+            crc ^= bytes[i];
+            nonzero += bytes[i] != 0;
+            for (unsigned bit = 0; bit < 8; bit++)
+               crc = (crc >> 1) ^
+                     (0xedb88320u & -(int32_t)(crc & 1));
+         }
+         crc = ~crc;
+         munmap(map, map_size);
+      } else {
+         crc = 0;
+      }
+
+      mesa_logi("pan-resource-import fd=%d extent=%ux%u stride=%u "
+                "offset=%u modifier=0x%llx stat-size=%lld span=%llu "
+                "crc=%08x nonzero=%u",
+                whandle->handle, templat->width0, templat->height0,
+                whandle->stride, whandle->offset,
+                (unsigned long long)mod,
+                stat_ret == 0 ? (long long)st.st_size : -1ll,
+                (unsigned long long)span, crc, nonzero);
    }
 
    int ret = panfrost_resource_import_bo(rsc, dev, whandle->handle);

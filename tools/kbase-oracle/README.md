@@ -64,6 +64,37 @@ The GLX probe names context, draw, finish, and swap boundaries, then performs
 120 move-and-resize cycles so a failure can be assigned to rendering,
 completion, presentation, or drawable reallocation.
 
+### DRI3 and texture-from-pixmap probes
+
+These focused probes separate compositor pixmap transport from ordinary window
+presentation:
+
+| Probe | Contract checked |
+|---|---|
+| `dri3_pixmap_export_probe.c` | X-server `BufferFromPixmap`, DMA-BUF contents, and Kbase import of the exported descriptor |
+| `egl_dmabuf_import_probe.c` | EGL DMA-BUF import and GLES sampling of an exported X pixmap |
+| `glx_tfp_probe.c` | `GLX_EXT_texture_from_pixmap` for a deterministic X pixmap |
+| `glx_window_tfp_probe.c` | The redirected-window path used by X11 compositors |
+| `glx_texture_upload_probe.c` | A control workload that uploads the same pattern without texture-from-pixmap |
+| `tfp_copy_probe.c` | Optional preload trace for the legacy `XGetImage` copy fallback |
+| `gdb_tfp_probe.py` | Optional GDB trace of resource mapping and copy boundaries |
+
+Build the primary GLX checks inside the arm64 guest:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror \
+  tools/kbase-oracle/glx_tfp_probe.c -lGL -lX11 \
+  -o /tmp/glx_tfp_probe
+cc -std=c11 -Wall -Wextra -Werror \
+  tools/kbase-oracle/glx_window_tfp_probe.c -lGL -lX11 -lXcomposite \
+  -o /tmp/glx_window_tfp_probe
+```
+
+Use `PAN_RAW_TFP_TRACE=1` with the direct Panfrost run to correlate the probe's
+readback CRC with the DRI3 reply, Gallium import, and Kbase import. A compositor
+pixmap reaching `XGetImage` means direct server-pixmap export failed; it is not
+evidence that the GPU render itself failed.
+
 ## Capture
 
 Run one deterministic workload per process. The stock and PanVK runs must use

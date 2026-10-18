@@ -1,5 +1,7 @@
 # [Mesa](https://mesa3d.org) - The 3D Graphics Library
 
+![Panfrost Mali-G78 rendering glmark2 inside Plasma on uDroid](docs/panfrost-plasma-proof.png)
+
 <!-- biblioklept -->
 
 ## Experimental Android kbase PanVK fork
@@ -100,6 +102,7 @@ Use the matching libraries and explicitly opt in to the Kbase JM path:
 ```sh
 export DISPLAY=unix/:0
 export PAN_EXPERIMENTAL_KBASE_GL=1
+export PAN_KBASE_GL_DRI3=1
 export LD_LIBRARY_PATH=/opt/udroid/panfrost-jm/lib:/usr/lib/aarch64-linux-gnu
 export LIBGL_DRIVERS_PATH=/opt/udroid/panfrost-jm/lib/dri
 export MESA_LOADER_DRIVER_OVERRIDE=panfrost
@@ -109,15 +112,17 @@ glxgears
 ```
 
 `glxinfo -B` must report `Mali-G78 MC20 (Panfrost)` rather than softpipe or
-llvmpipe. The current X11 bridge reads completed GPU resources back to the CPU
-and sends them through the normal X11 image path, so it is a correctness
-checkpoint rather than the final low-copy presentation design.
+llvmpipe. `PAN_KBASE_GL_DRI3=1` selects the raw dma-buf GLX bridge for windows
+and compositor pixmaps. It requires the matching uDroid/Termux:X11 patches;
+without them, leave the variable unset to use the slower X11 image fallback.
 
 ### Runtime flags
 
 | Variable | Purpose |
 | --- | --- |
 | `PAN_EXPERIMENTAL_KBASE_GL=1` | Enable the direct Tensor G1 JM Gallium path. |
+| `PAN_KBASE_GL_DRI3=1` | Enable raw dma-buf GLX window presentation and direct compositor-pixmap import with a compatible X server. |
+| `PAN_RAW_TFP_TRACE=1` | Trace DRI3 pixmap export/import and texture-from-pixmap contents; diagnostic only. |
 | `MESA_LOADER_DRIVER_OVERRIDE` | Use `panfrost` for direct GL or `zink` for OpenGL over PanVK; do not combine the paths. |
 | `PAN_MESA_DEBUG=sync` | Wait for every Panfrost job and report faults; use for diagnosis, not performance testing. |
 | `VK_DRIVER_FILES=/path.json` | Select only the requested PanVK Vulkan ICD. |

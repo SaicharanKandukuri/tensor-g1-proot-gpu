@@ -28,7 +28,12 @@
 
 #include "mesa_interface.h"
 #include "git_sha1.h"
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "util/format/u_format.h"
+#include "util/u_debug.h"
+#include "util/log.h"
 #include "util/u_memory.h"
 #include "util/u_inlines.h"
 #include "util/box.h"
@@ -50,6 +55,25 @@
 #endif
 
 DEBUG_GET_ONCE_BOOL_OPTION(swrast_no_present, "SWRAST_NO_PRESENT", false);
+DEBUG_GET_ONCE_BOOL_OPTION(pan_tfp_trace, "PAN_TFP_TRACE", false);
+
+static uint64_t
+drisw_tfp_hash(const char *map, unsigned stride, unsigned row_bytes,
+               unsigned height)
+{
+   uint64_t hash = 1469598103934665603ull;
+
+   for (unsigned y = 0; y < height; y++) {
+      const uint8_t *row = (const uint8_t *)map + (size_t)y * stride;
+
+      for (unsigned x = 0; x < row_bytes; x++) {
+         hash ^= row[x];
+         hash *= 1099511628211ull;
+      }
+   }
+
+   return hash;
+}
 
 static inline void
 get_drawable_info(struct dri_drawable *drawable, int *x, int *y, int *w, int *h)
@@ -565,6 +589,7 @@ drisw_update_tex_buffer(struct dri_drawable *drawable,
                         struct dri_context *ctx,
                         struct pipe_resource *res)
 {
+   static uint64_t sequence;
    struct st_context *st_ctx = (struct st_context *)ctx->st;
    struct pipe_context *pipe = st_ctx->pipe;
    struct pipe_transfer *transfer;
@@ -586,16 +611,36 @@ drisw_update_tex_buffer(struct dri_drawable *drawable,
                            x, y, w, h, &transfer);
 
    /* Copy the Drawable content to the mapped texture buffer */
-   if (!get_image_shm(drawable, x, y, w, h, res))
+   bool shm = get_image_shm(drawable, x, y, w, h, res);
+   if (!shm)
       get_image(drawable, x, y, w, h, map);
 
    /* The pipe transfer has a pitch rounded up to the nearest 64 pixels.
       get_image() has a pitch rounded up to 4 bytes.  */
    ximage_stride = ((w * cpp) + 3) & -4;
+   uint64_t tight_hash = 0;
+   if (debug_get_option_pan_tfp_trace())
+      tight_hash = drisw_tfp_hash(map, ximage_stride, ximage_stride, h);
+
    for (line = h-1; line; --line) {
       memmove(&map[line * transfer->stride],
               &map[line * ximage_stride],
               ximage_stride);
+   }
+
+   if (debug_get_option_pan_tfp_trace()) {
+      uint64_t expanded_hash =
+         drisw_tfp_hash(map, transfer->stride, ximage_stride, h);
+      mesa_logi("tfp-upload seq=%" PRIu64 " drawable=%p resource=%p "
+                "xy=%d,%d extent=%dx%d resource_extent=%ux%u format=%s "
+                "bind=0x%x flags=0x%x usage=%u map=%p transfer=%p "
+                "transfer_stride=%u ximage_stride=%d shm=%d "
+                "tight_hash=%016" PRIx64 " expanded_hash=%016" PRIx64,
+                ++sequence, (void *)drawable, (void *)res, x, y, w, h,
+                res->width0, res->height0, util_format_short_name(res->format),
+                res->bind, res->flags, res->usage, (void *)map,
+                (void *)transfer, transfer->stride, ximage_stride, shm,
+                tight_hash, expanded_hash);
    }
 
    pipe_texture_unmap(pipe, transfer);

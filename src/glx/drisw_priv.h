@@ -28,6 +28,11 @@
 
 #include <X11/extensions/XShm.h>
 #include "kopper_interface.h"
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "loader_dri3_helper.h"
+#endif
+
+struct pipe_resource;
 
 struct drisw_display
 {
@@ -38,6 +43,7 @@ struct drisw_screen
    struct glx_screen base;
 
    bool kopper;
+   bool raw_dri3;
 };
 
 struct drisw_drawable
@@ -50,6 +56,14 @@ struct drisw_drawable
    XShmSegmentInfo shminfo;
    int xDepth;
    int swapInterval;
+#ifdef HAVE_PAN_KMOD_KBASE
+   bool raw_dri3;
+   struct loader_dri3_drawable loader_drawable;
+   void (*raw_dri3_fallback_update_tex_buffer)(
+      struct dri_drawable *drawable,
+      struct dri_context *ctx,
+      struct pipe_resource *resource);
+#endif
 };
 
 #endif
