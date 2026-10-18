@@ -15,6 +15,16 @@ struct drm_panthor_csif_info;
 
 struct pan_kmod_dev;
 
+enum kbase_kmod_jm_job_type {
+   KBASE_KMOD_JM_JOB_VERTEX_TILER,
+   KBASE_KMOD_JM_JOB_FRAGMENT,
+};
+
+bool kbase_kmod_dev_is_jm(const struct pan_kmod_dev *dev);
+int kbase_kmod_jm_submit_sync(struct pan_kmod_dev *dev, uint64_t jc,
+                              enum kbase_kmod_jm_job_type type,
+                              int64_t timeout_ns);
+
 /* CSF interface information for a kbase CSF device, presented in the
  * panthor uAPI layout so CSF-generic code can consume either backend.
  * Filled from KBASE_IOCTL_CS_GET_GLB_IFACE at device-create time.

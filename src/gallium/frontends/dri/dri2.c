@@ -1710,7 +1710,11 @@ dri2_init_screen(struct dri_screen *screen, bool driver_name_is_inferred)
    screen->can_share_buffer = true;
 
 #ifdef HAVE_LIBDRM
-   if (pipe_loader_drm_probe_fd(&screen->dev, screen->fd, false))
+   if (pipe_loader_drm_probe_fd(&screen->dev, screen->fd, false)
+#if defined(HAVE_PAN_KMOD_KBASE)
+       || pipe_loader_kbase_probe_fd(&screen->dev, screen->fd)
+#endif
+   )
       pscreen = pipe_loader_create_screen(screen->dev, driver_name_is_inferred);
 #endif
 

@@ -384,6 +384,21 @@ fail:
    return false;
 }
 
+bool
+pipe_loader_kbase_probe_fd(struct pipe_loader_device **dev, int fd)
+{
+   int new_fd;
+
+   if (fd < 0 || (new_fd = os_dupfd_cloexec(fd)) < 0)
+      return false;
+
+   if (pipe_loader_kbase_probe_fd_nodup(dev, new_fd))
+      return true;
+
+   close(new_fd);
+   return false;
+}
+
 int
 pipe_loader_kbase_probe(struct pipe_loader_device **devs, int ndev)
 {

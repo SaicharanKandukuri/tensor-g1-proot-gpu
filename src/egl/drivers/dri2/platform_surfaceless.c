@@ -221,6 +221,37 @@ static const __DRIextension *kopper_loader_extensions[] = {
 };
 
 static bool
+surfaceless_probe_kbase(_EGLDisplay *disp)
+{
+#if defined(HAVE_PAN_KMOD_KBASE)
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   const char *opt_in = getenv("PAN_EXPERIMENTAL_KBASE_GL");
+
+   if (!opt_in || strcmp(opt_in, "1") != 0 ||
+       _eglHasAttrib(disp, EGL_DEVICE_EXT))
+      return false;
+
+   dri2_dpy->fd_render_gpu = loader_open_device("/dev/mali0");
+   if (dri2_dpy->fd_render_gpu < 0)
+      return false;
+
+   dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
+   dri2_dpy->driver_name = strdup("kbase");
+   dri2_dpy->loader_extensions = image_loader_extensions;
+
+   if (dri2_dpy->driver_name && dri2_create_screen(disp))
+      return true;
+
+   free(dri2_dpy->driver_name);
+   dri2_dpy->driver_name = NULL;
+   close(dri2_dpy->fd_render_gpu);
+   dri2_dpy->fd_render_gpu = -1;
+   dri2_dpy->fd_display_gpu = -1;
+#endif
+   return false;
+}
+
+static bool
 surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
 {
    const unsigned node_type = swrast ? DRM_NODE_PRIMARY : DRM_NODE_RENDER;
@@ -387,8 +418,10 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
    /* When ForceSoftware is false, we try the HW driver.  When ForceSoftware
     * is true, we try kms_swrast and swrast in order.
     */
-   driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
-                                            disp->Options.Zink);
+   driver_loaded = !disp->Options.ForceSoftware && surfaceless_probe_kbase(disp);
+   if (!driver_loaded)
+      driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
+                                               disp->Options.Zink);
    if (!driver_loaded && disp->Options.ForceSoftware) {
       _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
       driver_loaded = surfaceless_probe_device_sw(disp);

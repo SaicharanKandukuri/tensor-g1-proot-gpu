@@ -43,6 +43,10 @@
 #include "panfrost_tracepoints.h"
 #include "panfrost_perfetto.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
 bool
 panfrost_writes_point_size(struct panfrost_context *ctx)
 {
@@ -626,13 +630,15 @@ panfrost_destroy(struct pipe_context *pipe)
 
    util_dynarray_fini(&panfrost->global_buffers);
 
-   drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->in_sync_obj);
+   if (panfrost->in_sync_obj)
+      drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->in_sync_obj);
    if (panfrost->in_sync_fd != -1) {
       close(panfrost->in_sync_fd);
       panfrost->in_sync_fd = -1;
    }
 
-   drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->syncobj);
+   if (panfrost->syncobj)
+      drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->syncobj);
    ralloc_free(pipe);
 }
 
@@ -1069,16 +1075,24 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    struct pipe_context *gallium = (struct pipe_context *)ctx;
    struct panfrost_device *dev = pan_device(screen);
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
+#else
+   bool is_kbase_jm = false;
+#endif
+
    int ret;
 
    /* Create a syncobj in a signaled state. Will be updated to point to the
     * last queued job out_sync every time we submit a new job.
     */
-   ret = drmSyncobjCreate(panfrost_device_fd(dev), DRM_SYNCOBJ_CREATE_SIGNALED,
-                          &ctx->syncobj);
-   if (ret) {
-      ralloc_free(ctx);
-      return NULL;
+   if (!is_kbase_jm) {
+      ret = drmSyncobjCreate(panfrost_device_fd(dev),
+                             DRM_SYNCOBJ_CREATE_SIGNALED, &ctx->syncobj);
+      if (ret) {
+         ralloc_free(ctx);
+         return NULL;
+      }
    }
 
    gallium->screen = screen;
@@ -1088,8 +1102,10 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    gallium->set_framebuffer_state = panfrost_set_framebuffer_state;
    gallium->set_debug_callback = u_default_set_debug_callback;
 
-   gallium->create_fence_fd = panfrost_create_fence_fd;
-   gallium->fence_server_sync = panfrost_fence_server_sync;
+   if (!is_kbase_jm) {
+      gallium->create_fence_fd = panfrost_create_fence_fd;
+      gallium->fence_server_sync = panfrost_fence_server_sync;
+   }
 
    gallium->flush = panfrost_flush;
    gallium->clear = panfrost_blitter_clear;
@@ -1181,8 +1197,10 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    /* Sync object/FD used for NATIVE_FENCE_FD. */
    ctx->in_sync_fd = -1;
-   ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &ctx->in_sync_obj);
-   assert(!ret);
+   if (!is_kbase_jm) {
+      ret = drmSyncobjCreate(panfrost_device_fd(dev), 0, &ctx->in_sync_obj);
+      assert(!ret);
+   }
 
    ctx->printf.bo =
       panfrost_bo_create(dev, PAN_PRINTF_BUFFER_SIZE, 0, "Printf Buffer");

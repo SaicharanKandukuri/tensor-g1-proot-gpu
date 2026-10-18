@@ -41,6 +41,10 @@
 #include "pan_context.h"
 #include "panfrost_perfetto.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
 #define DEFAULT_MAX_AFBC_PACKING_RATIO 90
 
 /* clang-format off */
@@ -681,6 +685,11 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->vendor_id = ARM_VENDOR_ID;
 
    struct panfrost_device *dev = &screen->dev;
+#ifdef HAVE_PAN_KMOD_KBASE
+   bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
+#else
+   bool is_kbase_jm = false;
+#endif
 
    /* Our GL 3.x implementation is WIP */
    bool is_gl3 = dev->debug & PAN_DBG_GL3;
@@ -724,11 +733,11 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
       panfrost_device_gpu_rev(dev) >= dev->model->min_rev_anisotropic;
 
    /* Compile side is TODO for Midgard. */
-   caps->shader_clock = dev->arch >= 6 &&
-      dev->kmod.dev->props.gpu_can_query_timestamp;
-   caps->shader_realtime_clock = dev->arch >= 6 &&
-      dev->kmod.dev->props.gpu_can_query_timestamp &&
-      dev->kmod.dev->props.timestamp_device_coherent;
+   caps->shader_clock = !is_kbase_jm && dev->arch >= 6 &&
+                        dev->kmod.dev->props.gpu_can_query_timestamp;
+   caps->shader_realtime_clock = !is_kbase_jm && dev->arch >= 6 &&
+                                 dev->kmod.dev->props.gpu_can_query_timestamp &&
+                                 dev->kmod.dev->props.timestamp_device_coherent;
 
    /* pixel_local_storage is initially for valhall and bifrost only */
    caps->shader_pixel_local_storage_fast_size =
@@ -909,10 +918,12 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    caps->supported_prim_modes =
    caps->supported_prim_modes_with_restart = modes;
 
-   caps->native_fence_fd = true;
+   caps->native_fence_fd = !is_kbase_jm;
 
-   caps->context_priority_mask = from_kmod_group_allow_priority_flags(
-      dev->kmod.dev->props.allowed_group_priorities_mask);
+   caps->context_priority_mask =
+      is_kbase_jm ? 0
+                  : from_kmod_group_allow_priority_flags(
+                       dev->kmod.dev->props.allowed_group_priorities_mask);
 
    caps->astc_decode_mode = dev->arch >= 7 && (dev->compressed_formats & (1 << 30));
 
@@ -1131,7 +1142,10 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    screen->base.get_disk_shader_cache = panfrost_get_disk_shader_cache;
    screen->base.fence_reference = panfrost_fence_reference;
    screen->base.fence_finish = panfrost_fence_finish;
-   screen->base.fence_get_fd = panfrost_fence_get_fd;
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (!kbase_kmod_dev_is_jm(dev->kmod.dev))
+#endif
+      screen->base.fence_get_fd = panfrost_fence_get_fd;
    screen->base.set_damage_region = panfrost_resource_set_damage_region;
    screen->base.query_compression_rates = panfrost_query_compression_rates;
    screen->base.query_compression_modifiers =

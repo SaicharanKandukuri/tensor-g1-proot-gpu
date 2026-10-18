@@ -644,6 +644,8 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
 
    if (glx_driver)
       loader_extensions_local = kopper_extensions_noshm;
+   else if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false))
+      loader_extensions_local = loader_extensions_noshm;
 #ifdef HAVE_SYS_SHM_H
    else if (!x11_xcb_display_supports_xshm(XGetXCBConnection(priv->dpy), &xshm_opcode))
       loader_extensions_local = loader_extensions_noshm;

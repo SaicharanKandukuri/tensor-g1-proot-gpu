@@ -15,6 +15,10 @@
 #include "util/os_time.h"
 #include "util/u_inlines.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
 void
 panfrost_fence_reference(struct pipe_screen *pscreen,
                          struct pipe_fence_handle **ptr,
@@ -24,7 +28,8 @@ panfrost_fence_reference(struct pipe_screen *pscreen,
    struct pipe_fence_handle *old = *ptr;
 
    if (pipe_reference(&old->reference, &fence->reference)) {
-      drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
+      if (old->syncobj)
+         drmSyncobjDestroy(panfrost_device_fd(dev), old->syncobj);
       free(old);
    }
 
@@ -40,6 +45,9 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
 
    if (fence->signaled)
       return true;
+
+   if (!fence->syncobj)
+      return false;
 
    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    if (abs_timeout == OS_TIMEOUT_INFINITE)
@@ -58,6 +66,9 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
    struct panfrost_device *dev = pan_device(screen);
    int fd = -1;
 
+   if (!f->syncobj)
+      return -1;
+
    drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
    return fd;
 }
@@ -68,6 +79,11 @@ panfrost_fence_from_fd(struct panfrost_context *ctx, int fd,
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
    int ret;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+      return NULL;
+#endif
 
    struct pipe_fence_handle *f = calloc(1, sizeof(*f));
    if (!f)
@@ -110,6 +126,18 @@ panfrost_fence_create(struct panfrost_context *ctx)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
    int fd = -1, ret;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev)) {
+      struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+      if (!f)
+         return NULL;
+
+      pipe_reference_init(&f->reference, 1);
+      f->signaled = true;
+      return f;
+   }
+#endif
 
    /* Snapshot the last rendering out fence. We'd rather have another
     * syncobj instead of a sync file, but this is all we get.

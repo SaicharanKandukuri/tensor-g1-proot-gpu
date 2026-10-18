@@ -235,6 +235,9 @@ pipe_loader_accel_probe(struct pipe_loader_device **devs, int ndev);
  */
 int
 pipe_loader_kbase_probe(struct pipe_loader_device **devs, int ndev);
+
+bool
+pipe_loader_kbase_probe_fd(struct pipe_loader_device **dev, int fd);
 #endif
 
 #ifdef HAVE_ZINK

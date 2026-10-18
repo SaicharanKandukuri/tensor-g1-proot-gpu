@@ -33,6 +33,37 @@ cc -shared -fPIC -std=c11 -Wall -Wextra -Werror -pthread \
   -o /tmp/libkbase_oracle_capture.so
 ```
 
+### GLES and GLX probes
+
+Build the deterministic GLES2 pbuffer probe with the Android NDK:
+
+```sh
+tools/kbase-oracle/build_gles_oracle_android.sh \
+  "$ANDROID_NDK_HOME" /tmp/kbase-gles
+
+/tmp/kbase-gles/gles_oracle clear
+/tmp/kbase-gles/gles_oracle constant
+/tmp/kbase-gles/gles_oracle varying
+```
+
+Each case reports the EGL platform, GL implementation, sample pixels, and an
+RGBA8 readback hash. Compare the same case between two drivers; the probe is
+not a benchmark.
+
+Build the staged GLX drawable-lifecycle probe inside an arm64 glibc guest:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror \
+  tools/kbase-oracle/glx_stage_probe.c -lGL -lX11 \
+  -o /tmp/glx_stage_probe
+
+DISPLAY=:0 PAN_EXPERIMENTAL_KBASE_GL=1 /tmp/glx_stage_probe
+```
+
+The GLX probe names context, draw, finish, and swap boundaries, then performs
+120 move-and-resize cycles so a failure can be assigned to rendering,
+completion, presentation, or drawable reallocation.
+
 ## Capture
 
 Run one deterministic workload per process. The stock and PanVK runs must use

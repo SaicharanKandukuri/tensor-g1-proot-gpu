@@ -85,6 +85,7 @@ KBASE_JM_ABI_IOCTL(KBASE_IOCTL_VERSION_CHECK_CSF, 52, _IOC_READ | _IOC_WRITE,
                    4);
 KBASE_JM_ABI_IOCTL(KBASE_IOCTL_VERSION_CHECK_JM, 0, _IOC_READ | _IOC_WRITE, 4);
 KBASE_JM_ABI_IOCTL(KBASE_IOCTL_SET_FLAGS, 1, _IOC_WRITE, 4);
+KBASE_JM_ABI_IOCTL(KBASE_IOCTL_JOB_SUBMIT, 2, _IOC_WRITE, 16);
 KBASE_JM_ABI_IOCTL(KBASE_IOCTL_GET_GPUPROPS, 3, _IOC_WRITE, 16);
 KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_ALLOC, 5, _IOC_READ | _IOC_WRITE, 32);
 KBASE_JM_ABI_IOCTL(KBASE_IOCTL_MEM_FREE, 7, _IOC_WRITE, 8);
@@ -104,6 +105,24 @@ KBASE_JM_ABI_OFFSET(struct kbase_ioctl_version_check, minor, 2);
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_set_flags, 4);
 KBASE_JM_ABI_ALIGN(struct kbase_ioctl_set_flags, 4);
 KBASE_JM_ABI_OFFSET(struct kbase_ioctl_set_flags, create_flags, 0);
+
+KBASE_JM_ABI_SIZE(struct kbase_ioctl_job_submit, 16);
+KBASE_JM_ABI_ALIGN(struct kbase_ioctl_job_submit, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_job_submit, addr, 0);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_job_submit, nr_atoms, 8);
+KBASE_JM_ABI_OFFSET(struct kbase_ioctl_job_submit, stride, 12);
+
+KBASE_JM_ABI_SIZE(base_jd_atom, 64);
+KBASE_JM_ABI_ALIGN(base_jd_atom, 8);
+KBASE_JM_ABI_OFFSET(base_jd_atom, jc, 8);
+KBASE_JM_ABI_OFFSET(base_jd_atom, atom_number, 48);
+KBASE_JM_ABI_OFFSET(base_jd_atom, core_req, 52);
+
+KBASE_JM_ABI_SIZE(struct base_jd_event_v2, 24);
+KBASE_JM_ABI_ALIGN(struct base_jd_event_v2, 8);
+KBASE_JM_ABI_OFFSET(struct base_jd_event_v2, event_code, 0);
+KBASE_JM_ABI_OFFSET(struct base_jd_event_v2, atom_number, 4);
+KBASE_JM_ABI_OFFSET(struct base_jd_event_v2, udata, 8);
 
 KBASE_JM_ABI_SIZE(struct kbase_ioctl_get_gpuprops, 16);
 KBASE_JM_ABI_ALIGN(struct kbase_ioctl_get_gpuprops, 8);
@@ -204,6 +223,10 @@ _Static_assert(BASE_SYNCSET_OP_CSYNC == 2,
                "Tensor G1 JM memory invalidate operation ABI");
 _Static_assert(BASE_TIMEINFO_TIMESTAMP_FLAG == (1u << 1),
                "Tensor G1 JM timestamp request flag ABI");
+_Static_assert(BASE_JD_REQ_FS == 1, "Tensor G1 JM fragment request ABI");
+_Static_assert((BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V) == 0x16,
+               "Tensor G1 JM vertex-tiler request ABI");
+_Static_assert(BASE_JD_EVENT_DONE == 1, "Tensor G1 JM done event ABI");
 
 _Static_assert(KBASE_GPUPROP_VALUE_SIZE_U8 == 0,
                "Tensor G1 JM u8 property size ABI");
@@ -311,6 +334,11 @@ struct kbase_kmod_dev {
       uint64_t target_minus_one;
       int fence_fd;
    } kcpu;
+
+   struct {
+      simple_mtx_t lock;
+      bool lost;
+   } jm;
 };
 
 struct kbase_kmod_vm {
@@ -680,6 +708,120 @@ kbase_kmod_get_csif_props(const struct pan_kmod_dev *dev)
 
    assert(kbase_dev->is_csf);
    return &kbase_dev->csif_info;
+}
+
+bool
+kbase_kmod_dev_is_jm(const struct pan_kmod_dev *dev)
+{
+   if (!dev || dev->ops != &kbase_kmod_ops)
+      return false;
+
+   const struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, const struct kbase_kmod_dev, base);
+   return !kbase_dev->is_csf;
+}
+
+int
+kbase_kmod_jm_submit_sync(struct pan_kmod_dev *dev, uint64_t jc,
+                          enum kbase_kmod_jm_job_type type, int64_t timeout_ns)
+{
+   if (!kbase_kmod_dev_is_jm(dev) || !jc || timeout_ns <= 0) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   base_jd_core_req core_req;
+   switch (type) {
+   case KBASE_KMOD_JM_JOB_VERTEX_TILER:
+      core_req = BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V;
+      break;
+   case KBASE_KMOD_JM_JOB_FRAGMENT:
+      core_req = BASE_JD_REQ_FS;
+      break;
+   default:
+      errno = EINVAL;
+      return -1;
+   }
+
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+   simple_mtx_lock(&kbase_dev->jm.lock);
+
+   if (kbase_dev->jm.lost) {
+      errno = EIO;
+      simple_mtx_unlock(&kbase_dev->jm.lock);
+      return -1;
+   }
+
+   base_jd_atom atom = {
+      .jc = jc,
+      .atom_number = 1,
+      .core_req = core_req,
+   };
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uintptr_t)&atom,
+      .nr_atoms = 1,
+      .stride = sizeof(atom),
+   };
+
+   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
+      goto lost;
+
+   uint64_t deadline = os_time_get_nano() + timeout_ns;
+   struct pollfd pfd = {
+      .fd = dev->fd,
+      .events = POLLIN,
+   };
+   bool watchdog_warned = false;
+   int ret;
+
+   for (;;) {
+      do {
+         pfd.revents = 0;
+         uint64_t now = os_time_get_nano();
+         uint64_t remaining = deadline > now ? deadline - now : 0;
+         struct timespec timeout = {
+            .tv_sec = remaining / 1000000000ull,
+            .tv_nsec = remaining % 1000000000ull,
+         };
+         ret = ppoll(&pfd, 1, &timeout, NULL);
+      } while (ret < 0 && errno == EINTR);
+
+      if (ret)
+         break;
+
+      if (!watchdog_warned) {
+         mesa_logw("kbase: JM submission watchdog expired; continuing to wait");
+         watchdog_warned = true;
+      }
+      deadline = os_time_get_nano() + timeout_ns;
+   }
+
+   if (ret < 0 || !(pfd.revents & POLLIN)) {
+      if (ret >= 0)
+         errno = EIO;
+      goto lost;
+   }
+
+   struct base_jd_event_v2 event;
+   ssize_t len;
+   do {
+      len = read(dev->fd, &event, sizeof(event));
+   } while (len < 0 && errno == EINTR);
+
+   if (len != sizeof(event) || event.atom_number != atom.atom_number ||
+       event.event_code != BASE_JD_EVENT_DONE) {
+      errno = EIO;
+      goto lost;
+   }
+
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return 0;
+
+lost:
+   kbase_dev->jm.lost = true;
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return -1;
 }
 
 uint32_t
@@ -1448,6 +1590,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    kbase_dev->dma_heap_fd = -1;
    kbase_dev->kcpu.fence_fd = -1;
    simple_mtx_init(&kbase_dev->kcpu.lock, mtx_plain);
+   if (!is_csf)
+      simple_mtx_init(&kbase_dev->jm.lock, mtx_plain);
 
    if (is_csf && kbase_query_csif_info(fd, &kbase_dev->csif_info)) {
       mesa_loge("kbase: failed to query the CSF global interface");
@@ -1456,6 +1600,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       kbase_dev->base.flags &= ~PAN_KMOD_DEV_FLAG_OWNS_FD;
       pan_kmod_dev_cleanup(&kbase_dev->base);
       simple_mtx_destroy(&kbase_dev->kcpu.lock);
+      if (!is_csf)
+         simple_mtx_destroy(&kbase_dev->jm.lock);
       pan_kmod_free(allocator, kbase_dev);
       return NULL;
    }
@@ -1496,6 +1642,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       kbase_dev->base.flags &= ~PAN_KMOD_DEV_FLAG_OWNS_FD;
       pan_kmod_dev_cleanup(&kbase_dev->base);
       simple_mtx_destroy(&kbase_dev->kcpu.lock);
+      if (!is_csf)
+         simple_mtx_destroy(&kbase_dev->jm.lock);
       pan_kmod_free(allocator, kbase_dev);
       return NULL;
    }
@@ -1541,6 +1689,8 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *dev)
    }
    simple_mtx_unlock(&kbase_dev->kcpu.lock);
    simple_mtx_destroy(&kbase_dev->kcpu.lock);
+   if (!kbase_dev->is_csf)
+      simple_mtx_destroy(&kbase_dev->jm.lock);
 
    if (kbase_dev->user_reg_page)
       munmap(kbase_dev->user_reg_page, 4096);

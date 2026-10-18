@@ -17,6 +17,10 @@
 #include "pan_precomp.h"
 #include "pan_trace.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
 #if PAN_ARCH >= 10
 #error "JM helpers are only used for gen < 10"
 #endif
@@ -77,6 +81,12 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    uint32_t *bo_handles;
    int ret;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
+#else
+   bool is_kbase_jm = false;
+#endif
+
    /* If we trace, we always need a syncobj, so make one of our own if we
     * weren't given one to use. Remember that we did so, so we can free it
     * after we're done but preventing double-frees if we were given a
@@ -89,7 +99,10 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    submit.jc = first_job_desc;
    submit.requirements = reqs;
 
-   if (ctx->in_sync_fd >= 0) {
+   if (is_kbase_jm && ctx->in_sync_fd >= 0)
+      return ENOTSUP;
+
+   if (!is_kbase_jm && ctx->in_sync_fd >= 0) {
       ret = drmSyncobjImportSyncFile(panfrost_device_fd(dev), ctx->in_sync_obj,
                                      ctx->in_sync_fd);
       assert(!ret);
@@ -140,23 +153,42 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
       panfrost_bo_handle(dev->sample_positions);
 
    submit.bo_handles = (uint64_t)(uintptr_t)bo_handles;
-   if (ctx->is_noop)
+   if (ctx->is_noop) {
       ret = 0;
-   else
+   } else if (is_kbase_jm) {
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (reqs & PANFROST_JD_REQ_CYCLE_COUNT) {
+         ret = ENOTSUP;
+      } else {
+         enum kbase_kmod_jm_job_type type = (reqs & PANFROST_JD_REQ_FS)
+                                               ? KBASE_KMOD_JM_JOB_FRAGMENT
+                                               : KBASE_KMOD_JM_JOB_VERTEX_TILER;
+         if (kbase_kmod_jm_submit_sync(dev->kmod.dev, first_job_desc, type,
+                                       5000000000ll))
+            ret = errno ? errno : EIO;
+         else
+            ret = 0;
+      }
+#else
+      unreachable("kbase support is not compiled");
+#endif
+   } else {
       ret = pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANFROST_SUBMIT,
                            &submit);
+   }
    free(bo_handles);
 
    if (ret)
-      return errno;
+      return is_kbase_jm ? ret : errno;
 
    /* Trace the job if we're doing that */
    if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
-      /* Wait so we can get errors reported back */
-      ret = drmSyncobjWait(panfrost_device_fd(dev), &out_sync, 1, INT64_MAX,
-                           0, NULL);
-      if (ret)
-         return errno;
+      if (!is_kbase_jm) {
+         ret = drmSyncobjWait(panfrost_device_fd(dev), &out_sync, 1, INT64_MAX,
+                              0, NULL);
+         if (ret)
+            return errno;
+      }
 
       if (dev->debug & PAN_DBG_TRACE)
          pandecode_jc(dev->decode_ctx, submit.jc, panfrost_device_gpu_id(dev));
@@ -191,6 +223,11 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
 
    unsigned reqs =
       batch->need_job_req_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev) && (has_draws || has_frag))
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+#endif
 
    /* Take the submit lock to make sure no tiler jobs from other context
     * are inserted between our tiler and fragment jobs, failing to do that
@@ -1102,6 +1139,19 @@ GENX(jm_init_context)(struct panfrost_context *ctx)
 {
    PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
 
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev)) {
+      if (ctx->flags & (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_LOW_PRIORITY |
+                        PIPE_CONTEXT_REALTIME_PRIORITY))
+         return -1;
+
+      ctx->jm.handle = 0;
+      return 0;
+   }
+#endif
+
    /* The default context is medium prio, so we use that one. */
    if (!(ctx->flags &
          (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_LOW_PRIORITY))) {
@@ -1109,7 +1159,6 @@ GENX(jm_init_context)(struct panfrost_context *ctx)
       return 0;
    }
 
-   struct panfrost_device *dev = pan_device(ctx->base.screen);
    enum drm_panfrost_jm_ctx_priority prio;
 
    if (ctx->flags & PIPE_CONTEXT_HIGH_PRIORITY)
@@ -1139,6 +1188,11 @@ GENX(jm_cleanup_context)(struct panfrost_context *ctx)
    PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
 
    struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+      return;
+#endif
 
    if (!ctx->jm.handle) {
       /* Without an explicit JM context, nothing kills the jobs this context

@@ -192,11 +192,43 @@ drisw_present_texture(struct pipe_context *pipe, struct dri_drawable *drawable,
                       struct pipe_resource *ptex, unsigned nrects, struct pipe_box *sub_box)
 {
    struct dri_screen *screen = drawable->screen;
+   struct pipe_screen *pscreen = screen->base.screen;
 
    if (screen->swrast_no_present)
       return;
 
-   screen->base.screen->flush_frontbuffer(screen->base.screen, pipe, ptex, 0, 0, drawable, nrects, sub_box);
+   if (pscreen->flush_frontbuffer) {
+      pscreen->flush_frontbuffer(pscreen, pipe, ptex, 0, 0, drawable, nrects,
+                                 sub_box);
+      return;
+   }
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false)) {
+      struct pipe_box full_box;
+
+      if (!nrects) {
+         u_box_2d(0, 0, ptex->width0, ptex->height0, &full_box);
+         sub_box = &full_box;
+         nrects = 1;
+      }
+
+      for (unsigned i = 0; i < nrects; i++) {
+         struct pipe_transfer *transfer;
+         void *map = pipe_texture_map(pipe, ptex, 0, 0, PIPE_MAP_READ,
+                                      sub_box[i].x, sub_box[i].y,
+                                      sub_box[i].width, sub_box[i].height,
+                                      &transfer);
+
+         if (!map)
+            continue;
+
+         put_image2(drawable, map, sub_box[i].x, sub_box[i].y,
+                    sub_box[i].width, sub_box[i].height, transfer->stride);
+         pipe_texture_unmap(pipe, transfer);
+      }
+   }
+#endif
 }
 
 static inline void
@@ -617,6 +649,10 @@ drisw_init_screen(struct dri_screen *screen, bool driver_name_is_inferred)
    }
 
    bool success = false;
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false))
+      success = pipe_loader_kbase_probe(&screen->dev, 1) == 1;
+#endif
 #ifdef HAVE_DRISW_KMS
    if (screen->fd != -1)
       success = pipe_loader_sw_probe_kms(&screen->dev, screen->fd);

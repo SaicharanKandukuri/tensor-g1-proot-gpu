@@ -193,3 +193,73 @@ fault, stale frame, or early presentation.
 Every failed probe should first identify the boundary that diverged from stock.
 Driver changes follow only after the failure is reproducible and narrower
 instrumentation cannot explain it.
+
+## Direct Gallium GLX checkpoint
+
+Observed on 2026-10-18 using Pixel 6a build
+`google/bluejay/bluejay:17/CP3A.261005.002.A1/16269273:user/release-keys`,
+kernel `6.1.162-android14-11-g9dd05ae3a1de-ab16261587`, and a local build based
+on commit `f6876bdd326e12717fbaaa5f61c67d00e994ca3e`:
+
+- `PAN_EXPERIMENTAL_KBASE_GL=1` selected the Gallium Panfrost driver directly
+  over `/dev/mali0`. `glxinfo` reported `Mali-G78 MC20 (Panfrost)`, OpenGL 3.1,
+  OpenGL ES 3.1, and hardware acceleration. Without the opt-in variable the
+  same build selected softpipe.
+- The first visible-draw failure was isolated to `glXSwapBuffers`: rendering,
+  GPU completion, and fence wait succeeded, then the drisw frontend called the
+  hardware screen's null `flush_frontbuffer` hook. Normal DRM presentation does
+  not require that software-winsys callback.
+- The opt-in path now maps the completed Panfrost resource and passes it to the
+  existing drisw `putImage2` callback. It also avoids MIT-SHM because Android
+  SELinux prevents the separate Termux:X11 service from reading a SysV segment
+  created by the `run-as` PRoot process.
+- A 30-second `glxgears` run presented correct visible frames and reported five
+  consecutive five-second samples between 254.081 and 267.850 frames/s. These
+  are producer/copy rates, not physical display refresh measurements.
+- A staged GLX probe completed context creation, clear, triangle draw, two
+  swaps, and 120 move/resize/reallocation cycles. `glmark2 --validate` passed
+  its VBO, texture, shading, bump, 2D effect, desktop, buffer-update,
+  conditional, function, and loop reference cases. Scenes without validation
+  references reported `Unknown`, not failure.
+- With the Xfwm compositor enabled, a decorated `glxgears` window remained
+  visible and correct for eight consecutive five-second samples between
+  307.511 and 324.276 frames/s.
+- A bounded XFCE session with an isolated home directory launched its panel,
+  desktop, Thunar, and supporting services. A concurrent hardware GL client
+  rendered the `glmark2` terrain and four-window desktop-blur scenes visibly;
+  the measured results were 26 and 115 frames/s respectively, for score 69.
+  These numbers characterize the CPU-copy checkpoint only and are not release
+  performance targets.
+- No Mali job fault, MMU fault, device loss, or new cross-domain shared-memory
+  denial appeared in the post-test Android log.
+
+### Direct Gallium patch map
+
+- `src/panfrost/lib/kmod/kbase_kmod.*` implements serialized JM submission,
+  completion-event validation, a watchdog warning, and fail-closed device-loss
+  handling over the public Kbase UAPI.
+- `src/gallium/drivers/panfrost/pan_{device,jm,fence,context,screen}.*` selects
+  the JM-only Kbase path, flushes CPU-written mappings before submission, and
+  does not advertise unsupported DRM syncobj, native-fence, or priority paths.
+- `src/gallium/auxiliary/pipe-loader/*`,
+  `src/gallium/auxiliary/target-helpers/drm_helper.h`, and
+  `src/egl/drivers/dri2/platform_surfaceless.c` expose the `kbase` loader only
+  when `PAN_EXPERIMENTAL_KBASE_GL=1` is set and `/dev/mali0` is available.
+- `src/gallium/frontends/dri/{dri2,drisw}.c` and `src/glx/drisw_glx.c` map the
+  completed resource into the existing X11 image-copy frontend and disable
+  MIT-SHM for this opt-in path because the Termux:X11 service cannot read the
+  PRoot process's SysV segment under Android SELinux.
+- `tools/kbase-oracle/gles_oracle.c` and `glx_stage_probe.c` keep shader,
+  readback, swap, and drawable-lifecycle checks reproducible outside a desktop
+  session.
+
+The tested `libgallium-26.3.0-devel.so` SHA-256 is
+`ac8fd2519cd5f1dc31878a03ac6e5293fd763d560458dd8bf09d123a888f63a6`; the
+tested `libGL.so.1.2.0` SHA-256 is
+`70f479813b436e14bb024a4ad18c1107550549640bac60dd671ee65b99c3b164`.
+
+**Limit:** this is a correctness bridge with a CPU readback and X11 image copy
+on every presentation. It proves that direct Gallium rendering and drawable
+lifecycle work through Kbase JM, but it is not the final low-copy presentation
+path. Persistent app-managed desktop lifecycle and normal user configuration
+remain untested; the desktop smoke used a temporary isolated home directory.
