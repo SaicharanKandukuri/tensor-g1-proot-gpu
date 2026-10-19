@@ -8,7 +8,7 @@ applies cleanly.
 | Component | Upstream | Pinned revision | Patch |
 | --- | --- | --- | --- |
 | Mesa/Zink | `https://github.com/SaicharanKandukuri/tensor-g1-proot-gpu.git` | `608be7749cc9ec129d54b2e8251a0821fe4929eb` | `mesa/0001-support-khr-vertex-attribute-divisor.patch` |
-| libhybris | `https://github.com/libhybris/libhybris.git` | `7079712a42ea2754adf747e70c6cc75764c8596e` | `libhybris/0001-complete-locale-and-ui-compatibility.patch`, `libhybris/0002-support-relocatable-runtime-linking.patch`, `libhybris/0003-isolate-android-q-tls-in-static-reserve.patch` |
+| libhybris | `https://github.com/libhybris/libhybris.git` | `7079712a42ea2754adf747e70c6cc75764c8596e` | `libhybris/0001-complete-locale-and-ui-compatibility.patch`, `libhybris/0002-support-relocatable-runtime-linking.patch`, `libhybris/0003-isolate-android-q-tls-in-static-reserve.patch`, `libhybris/0004-redirect-raw-bionic-thread-pointer-reads.patch` |
 | sysvk | `https://github.com/xMeM/sysvk.git` | `23ecd775ed6fe06bb5ac0063b5f981f70c543c67` | `sysvk/0001-discover-and-validate-explicit-vulkan-hal.patch` |
 | xMeM WSI | `https://github.com/xMeM/vulkan-wsi-layer.git` | `d5624d42d8b2debbd910ad25662a05c751eb38b7` | `xmem-wsi/0001-port-ahb-x11-wsi-to-glibc-and-rgba-semantics.patch`, `xmem-wsi/0002-pass-sync-file-fences-to-x-present.patch`, `xmem-wsi/0003-negotiate-private-x11-buffer-transport.patch`, `xmem-wsi/0004-own-x11-present-thread-lifecycle.patch`, `xmem-wsi/0005-report-lost-x11-surfaces.patch`, `xmem-wsi/0006-make-swapchain-error-state-atomic.patch`, `xmem-wsi/0007-keep-filtered-layer-manifest-valid.patch`, `xmem-wsi/0008-respect-selected-build-type.patch` |
 | Termux:X11 | uDroid's pinned Termux:X11 submodule | recorded by the consuming uDroid revision | `termux-x11/0001-import-rgba-ahardwarebuffer-content-without-swizzle.patch`, `termux-x11/0002-import-linux-sync-file-fences.patch`, `termux-x11/0003-use-realtime-for-timed-mutex-deadline.patch`, `termux-x11/0004-gate-gpu-copy-hot-path-logging.patch`, `termux-x11/0005-advertise-buffer-transport-protocol.patch`, `termux-x11/0006-publish-present-offload-statistics.patch` |
@@ -110,7 +110,12 @@ concurrent instance lifecycles. On the Exynos 9611 qualification device, the
 same build also passed an 8 by 100 soak with no Android fatal signal or Mali
 fault.
 
-The sysvk environment override is a fallback, not the default discovery
-mechanism. A packager must discover an existing Vulkan HAL from Android's
-standard `vendor`, `odm`, or `system` hardware-module directories and pass only
-the validated absolute path.
+On AArch64 Android Q and newer, inline `MRS TPIDR_EL0` reads in Bionic and
+vendor code are redirected to that isolated TCB. Its `TLS_SLOT_THREAD_ID`
+points to a per-thread shadow so Bionic errno handling cannot dereference or
+overwrite glibc's TCB. Older linker generations retain their existing path.
+
+When `UDROID_VULKAN_HAL` is set, sysvk treats its validated absolute path as
+authoritative. Without it, normal Android HAL discovery remains available. A
+packager must discover the HAL only from Android's standard `vendor`, `odm`, or
+`system` hardware-module directories.

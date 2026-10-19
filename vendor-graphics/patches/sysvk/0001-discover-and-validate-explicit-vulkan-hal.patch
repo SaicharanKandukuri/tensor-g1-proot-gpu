@@ -1,19 +1,20 @@
 From: uDroid graphics runtime
-Subject: [PATCH] sysvk: discover and validate an explicit Vulkan HAL fallback
+Subject: [PATCH] sysvk: prefer and validate an explicit Vulkan HAL
 
-Use Android's normal HAL lookup first. If it fails in a rootless guest, permit
-an explicitly discovered HAL from the standard vendor, odm, or system hw
-directories. Validate the module contract before opening it and initialize the
-shared device exactly once.
+In a rootless guest, the legacy hardware-module lookup can resolve through a
+different linker context before libhybris opens the qualified vendor SPHAL.
+When UDROID_VULKAN_HAL is set, load that validated path first, matching modern
+Android's explicit Vulkan-driver selection. Retain normal HAL discovery when no
+explicit path is configured and initialize the shared device exactly once.
 ---
- sysvk.c | 81 +++++++++++++++++++++++++++++++++++++++++++++++++++-------
- 1 file changed, 71 insertions(+), 10 deletions(-)
+ sysvk.c | 85 ++++++++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 75 insertions(+), 10 deletions(-)
 
 diff --git a/sysvk.c b/sysvk.c
 index 78bfb16..d9d37b0 100644
 --- a/sysvk.c
 +++ b/sysvk.c
-@@ -1,20 +1,81 @@
+@@ -1,20 +1,85 @@
 +#include <dlfcn.h>
  #include <hardware/hardware.h>
  #include <hardware/hwvulkan.h>
@@ -85,8 +86,12 @@ index 78bfb16..d9d37b0 100644
 +
 +static void open_vulkan_device(void) {
 +  const hw_module_t *module = NULL;
-+  int result = hw_get_module(HWVULKAN_HARDWARE_MODULE_ID, &module);
-+  if (result != 0) module = load_explicit_hal();
++  const char *explicit_path = getenv("UDROID_VULKAN_HAL");
++  int result = 0;
++  if (explicit_path && explicit_path[0] != '\0')
++    module = load_explicit_hal();
++  else
++    result = hw_get_module(HWVULKAN_HARDWARE_MODULE_ID, &module);
 +  if (!module) return;
 +
 +  result = module->methods->open(module, HWVULKAN_DEVICE_0,

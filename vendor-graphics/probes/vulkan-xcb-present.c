@@ -57,6 +57,8 @@ static uint64_t monotonic_ns(void)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     uint64_t hold_ms = 6000;
     uint64_t frame_count = 1;
     uint64_t create_destroy_cycles = 0;
@@ -319,14 +321,21 @@ int main(int argc, char **argv)
     }
 
     VkSurfaceCapabilitiesKHR capabilities = {0};
+    printf("BEGIN stage=surface-capabilities\n");
     CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
                  physical, surface, &capabilities),
              "surface-capabilities");
+    printf("PASS stage=surface-capabilities extent=%ux%u images=%u-%u\n",
+           capabilities.currentExtent.width, capabilities.currentExtent.height,
+           capabilities.minImageCount, capabilities.maxImageCount);
     uint32_t format_count = 0;
+    printf("BEGIN stage=count-surface-formats\n");
     CHECK_VK(vkGetPhysicalDeviceSurfaceFormatsKHR(
                  physical, surface, &format_count, NULL),
              "count-surface-formats");
+    printf("PASS stage=count-surface-formats count=%u\n", format_count);
     VkSurfaceFormatKHR *formats = calloc(format_count, sizeof(*formats));
+    printf("BEGIN stage=surface-formats\n");
     CHECK_VK(vkGetPhysicalDeviceSurfaceFormatsKHR(
                  physical, surface, &format_count, formats),
              "surface-formats");

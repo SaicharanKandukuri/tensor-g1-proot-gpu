@@ -20,6 +20,8 @@ Current discovery checkpoints include:
   correctly selects `vendor-vulkan-ahb`;
 - `tensor-g1-bluejay-android17-native-termux-2026-08-18.md`: native Bionic
   Zink/application evidence, explicitly separate from glibc bridge approval.
+- `tensor-g1-bluejay-android17-proot-hybris-2026-10-19.md`: app-private PRoot
+  libhybris, sysvk, AHardwareBuffer X11 WSI, and visible Present checkpoint.
 
 WSI suite reports using the original lifecycle-only contract validate against
 `wsi-qualification-schema-v1.json`. New reports validate against
