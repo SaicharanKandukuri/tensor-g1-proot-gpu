@@ -51,6 +51,17 @@ If the X server does not support the private raw dma-buf transport, use
 Android permissions or SELinux; seeing a device node does not guarantee that
 its ioctls are permitted.
 
+Install the launcher for applications on display `:0`:
+
+```sh
+install -Dm755 tools/panvk-run /usr/local/bin/panvk-run
+panvk-run vkcube
+```
+
+The launcher defaults to the MIT-SHM presentation path. Set
+`PANVK_KBASE_DRI3=raw` only with a compatible X server and dma-heap. Packages
+using another ICD path can set `PANVK_ICD=/path/to/panfrost_icd.json`.
+
 ### Direct Panfrost OpenGL on Tensor G1
 
 The direct Gallium path is a separate experimental driver for the Tensor G1

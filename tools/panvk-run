@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 0 ]; then
+   echo "usage: panvk-run <command> [args...]" >&2
+   exit 2
+fi
+
+icd=${PANVK_ICD:-${VK_DRIVER_FILES:-/opt/panvk-kbase/share/vulkan/icd.d/panfrost_icd.aarch64.json}}
+if [ ! -r "$icd" ]; then
+   echo "panvk-run: ICD manifest not found: $icd" >&2
+   echo "set PANVK_ICD to the installed PanVK manifest" >&2
+   exit 1
+fi
+
+export DISPLAY=${DISPLAY:-:0}
+export VK_DRIVER_FILES=$icd
+unset VK_ICD_FILENAMES
+export PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1
+export PANVK_KBASE_DRI3=${PANVK_KBASE_DRI3:-0}
+
+exec "$@"
