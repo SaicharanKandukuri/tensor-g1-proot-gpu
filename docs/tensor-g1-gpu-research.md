@@ -243,8 +243,12 @@ on commit `f6876bdd326e12717fbaaa5f61c67d00e994ca3e`:
   does not advertise unsupported DRM syncobj, native-fence, or priority paths.
 - `src/gallium/auxiliary/pipe-loader/*`,
   `src/gallium/auxiliary/target-helpers/drm_helper.h`, and
-  `src/egl/drivers/dri2/platform_surfaceless.c` expose the `kbase` loader only
-  when `PAN_EXPERIMENTAL_KBASE_GL=1` is set and `/dev/mali0` is available.
+  `src/egl/drivers/dri2/platform_surfaceless.c` expose the `kbase` loader when
+  `/dev/mali0` is available. `PAN_EXPERIMENTAL_KBASE_GL=0` disables it.
+- `src/egl/drivers/dri2/platform_x11.c` tries standard DRI3 first, then routes
+  the existing X11 swrast frontend to Kbase when the X server cannot provide a
+  DRM render node. X11 builds use `egl-native-platform=x11`, so legacy EGL
+  applications do not need `EGL_PLATFORM=x11`.
 - `src/gallium/frontends/dri/{dri2,drisw}.c` and `src/glx/drisw_glx.c` map the
   completed resource into the existing X11 image-copy frontend and disable
   MIT-SHM for this opt-in path because the Termux:X11 service cannot read the

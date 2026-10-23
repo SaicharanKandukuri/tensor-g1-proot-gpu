@@ -225,9 +225,8 @@ surfaceless_probe_kbase(_EGLDisplay *disp)
 {
 #if defined(HAVE_PAN_KMOD_KBASE)
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
-   const char *opt_in = getenv("PAN_EXPERIMENTAL_KBASE_GL");
 
-   if (!opt_in || strcmp(opt_in, "1") != 0 ||
+   if (!debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", true) ||
        _eglHasAttrib(disp, EGL_DEVICE_EXT))
       return false;
 

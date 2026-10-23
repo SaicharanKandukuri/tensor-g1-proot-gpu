@@ -1120,7 +1120,7 @@ platform_x11_finalize(_EGLDisplay *disp, bool force_zink)
    if (!dri2_create_screen(disp))
       return false;
 
-   if (!dri2_setup_device(disp, disp->Options.ForceSoftware || force_zink)) {
+   if (!dri2_setup_device(disp, dri2_dpy->swrast || force_zink)) {
       _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to setup EGLDevice");
       return false;
    }
@@ -1230,6 +1230,7 @@ EGLBoolean
 dri2_initialize_x11(_EGLDisplay *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   bool kbase_swrast = false;
 
    /* True if we're going to force-enable a HW Zink driver, even if the X
     * server is missing a bunch of features.
@@ -1266,12 +1267,24 @@ dri2_initialize_x11(_EGLDisplay *disp)
     * We're going to enable Zink anyway.
     */
    if (!force_zink) {
-      bool status = dri3_x11_connect(dri2_dpy, disp->Options.ForceSoftware);
+      bool kbase_gl = false;
+#ifdef HAVE_PAN_KMOD_KBASE
+      kbase_gl = debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", true);
+#endif
+      bool status = dri3_x11_connect(
+         dri2_dpy, disp->Options.ForceSoftware || kbase_gl);
       /* the status here is ignored for zink-with-kopper and swrast,
        * otherwise return whatever error/fallback status as failure
        */
-      if (!status && !dri2_dpy->kopper && !disp->Options.ForceSoftware)
-         return EGL_FALSE;
+      if (!status && !dri2_dpy->kopper && !disp->Options.ForceSoftware) {
+         if (kbase_gl) {
+            dri2_dpy->driver_name = strdup("swrast");
+            if (!dri2_dpy->driver_name)
+               return EGL_FALSE;
+            kbase_swrast = true;
+         } else
+            return EGL_FALSE;
+      }
    }
 #endif
 
@@ -1280,7 +1293,7 @@ dri2_initialize_x11(_EGLDisplay *disp)
    if (dri2_dpy->kopper)
       return dri2_initialize_x11_kopper(disp, force_zink);
 
-   if (disp->Options.ForceSoftware)
+   if (disp->Options.ForceSoftware || kbase_swrast)
       return dri2_initialize_x11_swrast(disp);
 
 #ifdef HAVE_LIBDRM

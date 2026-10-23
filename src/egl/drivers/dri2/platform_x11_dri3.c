@@ -524,13 +524,13 @@ struct dri2_egl_display_vtbl dri3_x11_display_vtbl = {
 };
 
 bool
-dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool swrast)
+dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool suppress_error)
 {
    dri2_dpy->fd_render_gpu =
       x11_dri3_open(dri2_dpy->conn, dri2_dpy->screen->root, 0);
    if (dri2_dpy->fd_render_gpu < 0) {
       int conn_error = xcb_connection_has_error(dri2_dpy->conn);
-      if (!swrast) {
+      if (!suppress_error || conn_error) {
          _eglLog(_EGL_WARNING, "DRI3 error: Could not get DRI3 device");
          _eglLog(_EGL_WARNING, "Ensure your X server supports DRI3 to get accelerated rendering");
          if (conn_error)

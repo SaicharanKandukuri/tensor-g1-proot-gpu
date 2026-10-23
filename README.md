@@ -78,7 +78,7 @@ meson setup build-gallium-jm \
   -Dbuild-tests=false \
   -Ddisplay-info=disabled \
   -Degl=enabled \
-  -Degl-native-platform=surfaceless \
+  -Degl-native-platform=x11 \
   -Denable-glcpp-tests=false \
   -Dgallium-drivers=panfrost,softpipe \
   -Dgbm=enabled \
@@ -108,16 +108,22 @@ meson compile -C build-gallium-jm -j "$(nproc)"
 meson install -C build-gallium-jm
 ```
 
-Use the matching libraries and explicitly opt in to the Kbase JM path:
+Register the installed driver with the guest dynamic linker so applications
+that sanitize their environment still use the same Mesa build:
+
+```sh
+printf '%s\n' /opt/udroid/panfrost-jm/lib \
+  > /etc/ld.so.conf.d/00-udroid-panfrost.conf
+ldconfig
+```
+
+Use the matching libraries. The build automatically selects the Kbase JM path
+when an accessible `/dev/mali*` device is present:
 
 ```sh
 export DISPLAY=unix/:0
-export PAN_EXPERIMENTAL_KBASE_GL=1
 export PAN_KBASE_GL_DRI3=1
-export LD_LIBRARY_PATH=/opt/udroid/panfrost-jm/lib:/usr/lib/aarch64-linux-gnu
-export LIBGL_DRIVERS_PATH=/opt/udroid/panfrost-jm/lib/dri
-export MESA_LOADER_DRIVER_OVERRIDE=panfrost
-unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE
 glxinfo -B
 glxgears
 ```
@@ -131,7 +137,7 @@ without them, leave the variable unset to use the slower X11 image fallback.
 
 | Variable | Purpose |
 | --- | --- |
-| `PAN_EXPERIMENTAL_KBASE_GL=1` | Enable the direct Tensor G1 JM Gallium path. |
+| `PAN_EXPERIMENTAL_KBASE_GL=0` | Disable automatic Kbase JM Gallium selection. |
 | `PAN_KBASE_GL_DRI3=1` | Enable raw dma-buf GLX window presentation and direct compositor-pixmap import with a compatible X server. |
 | `PAN_RAW_TFP_TRACE=1` | Trace DRI3 pixmap export/import and texture-from-pixmap contents; diagnostic only. |
 | `MESA_LOADER_DRIVER_OVERRIDE` | Use `panfrost` for direct GL or `zink` for OpenGL over PanVK; do not combine the paths. |

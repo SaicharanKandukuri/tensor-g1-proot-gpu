@@ -57,7 +57,7 @@ cc -std=c11 -Wall -Wextra -Werror \
   tools/kbase-oracle/glx_stage_probe.c -lGL -lX11 \
   -o /tmp/glx_stage_probe
 
-DISPLAY=:0 PAN_EXPERIMENTAL_KBASE_GL=1 /tmp/glx_stage_probe
+DISPLAY=:0 /tmp/glx_stage_probe
 ```
 
 The GLX probe names context, draw, finish, and swap boundaries, then performs

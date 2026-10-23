@@ -920,7 +920,8 @@ driswCreateScreen(int screen, struct glx_display *priv, enum glx_driver glx_driv
    else if (psc->raw_dri3)
       loader_extensions_local = loader_extensions_raw_dri3;
 #endif
-   else if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false))
+   else if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", true) &&
+            !debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false))
       loader_extensions_local = loader_extensions_noshm;
 #ifdef HAVE_SYS_SHM_H
    else if (!x11_xcb_display_supports_xshm(XGetXCBConnection(priv->dpy), &xshm_opcode))

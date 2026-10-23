@@ -211,6 +211,15 @@ drisw_put_image_shm(struct dri_drawable *drawable,
    put_image_shm(drawable, shmid, shmaddr, offset, offset_x, x, y, width, height, stride);
 }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+static bool
+panfrost_kbase_gl_enabled(void)
+{
+   return debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", true) &&
+          !debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false);
+}
+#endif
+
 static inline void
 drisw_present_texture(struct pipe_context *pipe, struct dri_drawable *drawable,
                       struct pipe_resource *ptex, unsigned nrects, struct pipe_box *sub_box)
@@ -228,7 +237,7 @@ drisw_present_texture(struct pipe_context *pipe, struct dri_drawable *drawable,
    }
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false)) {
+   if (panfrost_kbase_gl_enabled()) {
       struct pipe_box full_box;
 
       if (!nrects) {
@@ -695,7 +704,7 @@ drisw_init_screen(struct dri_screen *screen, bool driver_name_is_inferred)
 
    bool success = false;
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", false))
+   if (panfrost_kbase_gl_enabled())
       success = pipe_loader_kbase_probe(&screen->dev, 1) == 1;
 #endif
 #ifdef HAVE_DRISW_KMS

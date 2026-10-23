@@ -8,6 +8,7 @@
 #include "drm-uapi/panfrost_drm.h"
 #include "util/hash_table.h"
 #include "util/macros.h"
+#include "util/u_debug.h"
 #include "util/u_math.h"
 #include "util/u_thread.h"
 #include "pan_bo.h"
@@ -25,13 +26,11 @@
 static bool
 panfrost_gl_on_kbase_allowed(void)
 {
-   const char *env = getenv("PAN_EXPERIMENTAL_KBASE_GL");
-   if (env && env[0] == '1' && env[1] == '\0')
+   if (debug_get_bool_option("PAN_EXPERIMENTAL_KBASE_GL", true) &&
+       !debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false))
       return true;
 
-   mesa_logw("panfrost: OpenGL on kbase has experimental synchronous JM "
-             "submission; not exposing a Gallium device by default. Set "
-             "PAN_EXPERIMENTAL_KBASE_GL=1 to opt in.");
+   mesa_logi("panfrost: OpenGL on kbase disabled by environment");
    return false;
 }
 #endif
