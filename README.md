@@ -192,7 +192,7 @@ export DISPLAY=:2
 export MESA_NATIVE="$HOME/panfrost-native-test"
 export PAN_EXPERIMENTAL_KBASE_GL=1 PAN_KBASE_GL_DRI3=1
 export LIBGL_DRIVERS_PATH="$MESA_NATIVE/lib/dri"
-export LD_LIBRARY_PATH="$MESA_NATIVE/lib:$PREFIX/lib"
+export LD_LIBRARY_PATH="$MESA_NATIVE/lib"
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 glxinfo -B
 glxgears
