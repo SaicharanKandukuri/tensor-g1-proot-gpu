@@ -133,6 +133,79 @@ llvmpipe. `PAN_KBASE_GL_DRI3=1` selects the raw dma-buf GLX bridge for windows
 and compositor pixmaps. It requires the matching uDroid/Termux:X11 patches;
 without them, leave the variable unset to use the slower X11 image fallback.
 
+### Native Termux OpenGL (Pixel 6a)
+
+This route runs Panfrost in Termux itself, without PRoot. Use the experimental
+[Termux:X11 Panfrost fork](https://github.com/RandomCoderOrg/termux-x11/tree/panfrost/dmabuf-present):
+download the `termux-x11-universal-debug` APK and `termux-companion packages`
+artifacts from a successful [branch build](https://github.com/RandomCoderOrg/termux-x11/actions/workflows/debug_build.yml?query=branch%3Apanfrost%2Fdmabuf-present).
+Install the APK on Android, copy the matching `.deb` into Termux, and run
+`pkg install ./termux-x11-*-all.deb`. The upstream nightly does not yet provide
+this fork's DMA-BUF Present GPU-copy path.
+
+In Termux, check access to `/dev/mali0` and `/dev/dma_heap/system` before
+building. Visibility alone does not prove Android permits the required ioctls.
+Install the native build tools and X11 dependencies:
+
+```sh
+ls -l /dev/mali0 /dev/dma_heap/system
+pkg install x11-repo
+pkg install clang bison flex git ninja python python-pip pkg-config llvm \
+  libdrm libandroid-shmem-static libglvnd-dev libx11 libxcb \
+  libxrandr libxshmfence libxxf86vm xorgproto zlib \
+  spirv-tools spirv-llvm-translator mesa-demos
+python -m pip install --user meson mako packaging pyyaml
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Build this branch into a private prefix; do not replace Termux's packaged Mesa.
+Both KMD names are needed by the current build even though the Pixel uses Kbase.
+Limit parallel jobs on memory-constrained phones:
+
+```sh
+git clone -b research/pixel6a-panvk-v9-jm \
+  https://github.com/SaicharanKandukuri/tensor-g1-proot-gpu.git
+cd tensor-g1-proot-gpu
+export MESA_NATIVE="$HOME/panfrost-native-test"
+meson setup pan-build --prefix="$MESA_NATIVE" --buildtype=release \
+  -Dwrap_mode=nodownload -Dplatforms=x11 \
+  -Dgallium-drivers=panfrost,softpipe -Dvulkan-drivers= \
+  -Dpanfrost-kmds=kbase,panthor -Dllvm=enabled -Dshared-llvm=enabled \
+  -Dgallium-rusticl=false -Dmesa-clc=enabled -Dglx=dri \
+  -Degl=enabled -Degl-native-platform=x11 -Dopengl=true \
+  -Dgles1=disabled -Dgles2=enabled -Dgbm=enabled -Dglvnd=enabled \
+  -Dxmlconfig=disabled \
+  -Dc_link_args='["-landroid-shmem","-llog"]' \
+  -Dcpp_link_args='["-landroid-shmem","-llog"]'
+ninja -C pan-build -j2
+meson install -C pan-build
+test -e "$MESA_NATIVE/lib/libGLX_mesa.so.0" || \
+  ln -s libGLX_mesa.so "$MESA_NATIVE/lib/libGLX_mesa.so.0"
+```
+
+Start the forked X server, then export the driver selection once for this shell
+and every application launched from it:
+
+```sh
+termux-x11 :2 -ac -noreset &
+export DISPLAY=:2
+export MESA_NATIVE="$HOME/panfrost-native-test"
+export PAN_EXPERIMENTAL_KBASE_GL=1 PAN_KBASE_GL_DRI3=1
+export LIBGL_DRIVERS_PATH="$MESA_NATIVE/lib/dri"
+export LD_LIBRARY_PATH="$MESA_NATIVE/lib:$PREFIX/lib"
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+glxinfo -B
+glxgears
+```
+
+`glxinfo -B` must identify the Mali-G78 Panfrost renderer. Keep these exports
+out of shell startup files: loading the private Mesa into unrelated Termux
+commands can break package management. The fork currently uploads FD-backed
+pixels to GLES rather than importing them zero-copy; on Pixel 6a, its GPU-copy
+route worked but a `glmark2` terrain test was slower than CPU fallback. If the
+AHardwareBuffer coherence check disables GPU-copy after a restart, do not force
+it past that safety check.
+
 ### Runtime flags
 
 | Variable | Purpose |
