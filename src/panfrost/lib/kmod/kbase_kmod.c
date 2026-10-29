@@ -34,6 +34,7 @@
  *    memory management.
  */
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/dma-heap.h>
@@ -338,6 +339,15 @@ struct kbase_kmod_dev {
    struct {
       simple_mtx_t lock;
       bool lost;
+      uint64_t submitted;
+      uint64_t completed;
+      unsigned head;
+      unsigned count;
+      struct {
+         uint64_t seqno;
+         uint8_t last_atom;
+         bool done;
+      } pending[16];
    } jm;
 };
 
@@ -721,105 +731,216 @@ kbase_kmod_dev_is_jm(const struct pan_kmod_dev *dev)
    return !kbase_dev->is_csf;
 }
 
-int
-kbase_kmod_jm_submit_sync(struct pan_kmod_dev *dev, uint64_t jc,
-                          enum kbase_kmod_jm_job_type type, int64_t timeout_ns)
+static int
+kbase_jm_wait_locked(struct kbase_kmod_dev *dev, uint64_t target,
+                     int64_t timeout_ns)
 {
-   if (!kbase_kmod_dev_is_jm(dev) || !jc || timeout_ns <= 0) {
-      errno = EINVAL;
-      return -1;
-   }
-
-   base_jd_core_req core_req;
-   switch (type) {
-   case KBASE_KMOD_JM_JOB_VERTEX_TILER:
-      core_req = BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V;
-      break;
-   case KBASE_KMOD_JM_JOB_FRAGMENT:
-      core_req = BASE_JD_REQ_FS;
-      break;
-   default:
-      errno = EINVAL;
-      return -1;
-   }
-
-   struct kbase_kmod_dev *kbase_dev =
-      container_of(dev, struct kbase_kmod_dev, base);
-   simple_mtx_lock(&kbase_dev->jm.lock);
-
-   if (kbase_dev->jm.lost) {
-      errno = EIO;
-      simple_mtx_unlock(&kbase_dev->jm.lock);
-      return -1;
-   }
-
-   base_jd_atom atom = {
-      .jc = jc,
-      .atom_number = 1,
-      .core_req = core_req,
-   };
-   struct kbase_ioctl_job_submit submit = {
-      .addr = (uintptr_t)&atom,
-      .nr_atoms = 1,
-      .stride = sizeof(atom),
-   };
-
-   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
-      goto lost;
-
-   uint64_t deadline = os_time_get_nano() + timeout_ns;
+   const bool infinite = timeout_ns == INT64_MAX;
+   uint64_t deadline = infinite ? 0 : os_time_get_nano() + timeout_ns;
    struct pollfd pfd = {
-      .fd = dev->fd,
+      .fd = dev->base.fd,
       .events = POLLIN,
    };
    bool watchdog_warned = false;
-   int ret;
-
-   for (;;) {
+   while (dev->jm.completed < target) {
+      if (dev->jm.lost) {
+         errno = EIO;
+         return -1;
+      }
+      int ret;
       do {
          pfd.revents = 0;
          uint64_t now = os_time_get_nano();
-         uint64_t remaining = deadline > now ? deadline - now : 0;
+         uint64_t remaining = infinite ? 5000000000ull
+                                       : (deadline > now ? deadline - now : 0);
          struct timespec timeout = {
             .tv_sec = remaining / 1000000000ull,
             .tv_nsec = remaining % 1000000000ull,
          };
          ret = ppoll(&pfd, 1, &timeout, NULL);
       } while (ret < 0 && errno == EINTR);
-
-      if (ret)
-         break;
-
-      if (!watchdog_warned) {
-         mesa_logw("kbase: JM submission watchdog expired; continuing to wait");
-         watchdog_warned = true;
+      if (!ret) {
+         if (!infinite) {
+            errno = ETIMEDOUT;
+            return -1;
+         }
+         if (!watchdog_warned) {
+            mesa_logw("kbase: JM submission watchdog expired; continuing to wait");
+            watchdog_warned = true;
+         }
+         continue;
       }
-      deadline = os_time_get_nano() + timeout_ns;
+      if (ret < 0 || !(pfd.revents & POLLIN))
+         goto lost;
+
+      struct base_jd_event_v2 event;
+      ssize_t len;
+      do {
+         len = read(dev->base.fd, &event, sizeof(event));
+      } while (len < 0 && errno == EINTR);
+      if (len != sizeof(event))
+         goto lost;
+      if (event.event_code != BASE_JD_EVENT_DONE) {
+         mesa_loge("kbase: JM atom %u failed with event 0x%x",
+                   event.atom_number, event.event_code);
+         goto lost;
+      }
+
+      bool found = false;
+      for (unsigned i = 0; i < dev->jm.count; i++) {
+         unsigned idx = (dev->jm.head + i) % ARRAY_SIZE(dev->jm.pending);
+         if (dev->jm.pending[idx].last_atom == event.atom_number) {
+            if (dev->jm.pending[idx].done)
+               goto lost;
+            dev->jm.pending[idx].done = true;
+            found = true;
+            break;
+         }
+      }
+      if (!found) {
+         mesa_loge("kbase: JM completion for unknown atom %u",
+                   event.atom_number);
+         goto lost;
+      }
+      while (dev->jm.count && dev->jm.pending[dev->jm.head].done) {
+         dev->jm.completed = dev->jm.pending[dev->jm.head].seqno;
+         dev->jm.head = (dev->jm.head + 1) % ARRAY_SIZE(dev->jm.pending);
+         dev->jm.count--;
+      }
    }
-
-   if (ret < 0 || !(pfd.revents & POLLIN)) {
-      if (ret >= 0)
-         errno = EIO;
-      goto lost;
-   }
-
-   struct base_jd_event_v2 event;
-   ssize_t len;
-   do {
-      len = read(dev->fd, &event, sizeof(event));
-   } while (len < 0 && errno == EINTR);
-
-   if (len != sizeof(event) || event.atom_number != atom.atom_number ||
-       event.event_code != BASE_JD_EVENT_DONE) {
-      errno = EIO;
-      goto lost;
-   }
-
-   simple_mtx_unlock(&kbase_dev->jm.lock);
    return 0;
 
 lost:
-   kbase_dev->jm.lost = true;
+   dev->jm.lost = true;
+   errno = EIO;
+   return -1;
+}
+
+int
+kbase_kmod_jm_wait(struct pan_kmod_dev *dev, uint64_t seqno,
+                   int64_t timeout_ns)
+{
+   if (!kbase_kmod_dev_is_jm(dev) || timeout_ns < 0) {
+      errno = EINVAL;
+      return -1;
+   }
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+   simple_mtx_lock(&kbase_dev->jm.lock);
+   int ret = seqno > kbase_dev->jm.submitted
+                ? -1
+                : kbase_jm_wait_locked(kbase_dev, seqno, timeout_ns);
+   if (seqno > kbase_dev->jm.submitted)
+      errno = EINVAL;
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return ret;
+}
+
+uint64_t
+kbase_kmod_jm_last_seqno(struct pan_kmod_dev *dev)
+{
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+   simple_mtx_lock(&kbase_dev->jm.lock);
+   uint64_t seqno = kbase_dev->jm.submitted;
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return seqno;
+}
+
+uint64_t
+kbase_kmod_jm_completed_seqno(struct pan_kmod_dev *dev)
+{
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+   simple_mtx_lock(&kbase_dev->jm.lock);
+   uint64_t seqno = kbase_dev->jm.completed;
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return seqno;
+}
+
+int
+kbase_kmod_jm_submit(struct pan_kmod_dev *dev, uint64_t vtc_jc,
+                     uint64_t frag_jc, uint64_t *seqno)
+{
+   if (!kbase_kmod_dev_is_jm(dev) || (!vtc_jc && !frag_jc) || !seqno) {
+      errno = EINVAL;
+      return -1;
+   }
+   *seqno = 0;
+   struct kbase_kmod_dev *kbase_dev =
+      container_of(dev, struct kbase_kmod_dev, base);
+   simple_mtx_lock(&kbase_dev->jm.lock);
+   if (kbase_dev->jm.lost) {
+      errno = EIO;
+      goto fail;
+   }
+   if (kbase_dev->jm.count == ARRAY_SIZE(kbase_dev->jm.pending) &&
+       kbase_jm_wait_locked(kbase_dev,
+                            kbase_dev->jm.pending[kbase_dev->jm.head].seqno,
+                            INT64_MAX))
+      goto fail;
+   assert(kbase_dev->jm.count < ARRAY_SIZE(kbase_dev->jm.pending));
+
+   unsigned idx = (kbase_dev->jm.head + kbase_dev->jm.count) %
+                  ARRAY_SIZE(kbase_dev->jm.pending);
+   uint8_t first_atom = idx * 2 + 1;
+   uint8_t prev_atom = 0;
+   if (kbase_dev->jm.count) {
+      unsigned prev = (idx + ARRAY_SIZE(kbase_dev->jm.pending) - 1) %
+                      ARRAY_SIZE(kbase_dev->jm.pending);
+      prev_atom = kbase_dev->jm.pending[prev].last_atom;
+   }
+   assert(prev_atom != first_atom);
+   base_jd_atom atoms[2] = {0};
+   unsigned nr_atoms = 0;
+   if (vtc_jc) {
+      atoms[nr_atoms++] = (base_jd_atom){
+         .jc = vtc_jc,
+         .atom_number = first_atom,
+         .core_req = BASE_JD_REQ_CS | BASE_JD_REQ_T | BASE_JD_REQ_V |
+                     (frag_jc ? BASE_JD_REQ_EVENT_ONLY_ON_FAILURE : 0),
+      };
+   }
+   if (frag_jc) {
+      atoms[nr_atoms] = (base_jd_atom){
+         .jc = frag_jc,
+         .atom_number = first_atom + nr_atoms,
+         .core_req = BASE_JD_REQ_FS,
+      };
+      if (nr_atoms) {
+         atoms[nr_atoms].pre_dep[0].atom_id = atoms[0].atom_number;
+         atoms[nr_atoms].pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_DATA;
+      }
+      nr_atoms++;
+   }
+   if (prev_atom) {
+      atoms[0].pre_dep[1].atom_id = prev_atom;
+      atoms[0].pre_dep[1].dependency_type = BASE_JD_DEP_TYPE_ORDER;
+   }
+   assert(atoms[nr_atoms - 1].atom_number == first_atom + nr_atoms - 1);
+   assert(nr_atoms != 2 ||
+          (atoms[1].pre_dep[0].atom_id == atoms[0].atom_number &&
+           atoms[1].pre_dep[0].dependency_type == BASE_JD_DEP_TYPE_DATA));
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uintptr_t)atoms,
+      .nr_atoms = nr_atoms,
+      .stride = sizeof(atoms[0]),
+   };
+   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+      *seqno = UINT64_MAX;
+      kbase_dev->jm.lost = true;
+      goto fail;
+   }
+
+   *seqno = ++kbase_dev->jm.submitted;
+   kbase_dev->jm.pending[idx].seqno = *seqno;
+   kbase_dev->jm.pending[idx].last_atom = atoms[nr_atoms - 1].atom_number;
+   kbase_dev->jm.pending[idx].done = false;
+   kbase_dev->jm.count++;
+   simple_mtx_unlock(&kbase_dev->jm.lock);
+   return 0;
+
+fail:
    simple_mtx_unlock(&kbase_dev->jm.lock);
    return -1;
 }
@@ -2162,21 +2283,16 @@ kbase_kmod_bo_munmap(UNUSED struct pan_kmod_bo *bo, UNUSED void *host_addr,
    return 0;
 }
 
-/* kbase does not expose per-BO fence objects.
- *
- * Returning true here is safe for non-shared BOs that have an exclusive_vm
- * (the common case for compute/render work) because the GPU is serialised by
- * the queue-submission path before the CPU touches the buffer.  For shared /
- * exported BOs proper inter-process synchronisation must be handled at a
- * higher level (e.g. via sync_file / Android fence).
- *
- * A full implementation would use KBASE_IOCTL_KCPU_QUEUE_ENQUEUE with a
- * fence-wait operation to block until the GPU has finished with the BO. */
 static bool
 kbase_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
                    bool for_read_only_access)
 {
-   return true;
+   struct kbase_kmod_dev *dev =
+      container_of(bo->dev, struct kbase_kmod_dev, base);
+   if (dev->is_csf)
+      return true;
+   return !kbase_kmod_jm_wait(bo->dev, kbase_kmod_jm_last_seqno(bo->dev),
+                              timeout_ns);
 }
 
 static int

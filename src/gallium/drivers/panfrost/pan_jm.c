@@ -81,12 +81,6 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    uint32_t *bo_handles;
    int ret;
 
-#ifdef HAVE_PAN_KMOD_KBASE
-   bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
-#else
-   bool is_kbase_jm = false;
-#endif
-
    /* If we trace, we always need a syncobj, so make one of our own if we
     * weren't given one to use. Remember that we did so, so we can free it
     * after we're done but preventing double-frees if we were given a
@@ -99,10 +93,7 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    submit.jc = first_job_desc;
    submit.requirements = reqs;
 
-   if (is_kbase_jm && ctx->in_sync_fd >= 0)
-      return ENOTSUP;
-
-   if (!is_kbase_jm && ctx->in_sync_fd >= 0) {
+   if (ctx->in_sync_fd >= 0) {
       ret = drmSyncobjImportSyncFile(panfrost_device_fd(dev), ctx->in_sync_obj,
                                      ctx->in_sync_fd);
       assert(!ret);
@@ -153,42 +144,22 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
       panfrost_bo_handle(dev->sample_positions);
 
    submit.bo_handles = (uint64_t)(uintptr_t)bo_handles;
-   if (ctx->is_noop) {
+   if (ctx->is_noop)
       ret = 0;
-   } else if (is_kbase_jm) {
-#ifdef HAVE_PAN_KMOD_KBASE
-      if (reqs & PANFROST_JD_REQ_CYCLE_COUNT) {
-         ret = ENOTSUP;
-      } else {
-         enum kbase_kmod_jm_job_type type = (reqs & PANFROST_JD_REQ_FS)
-                                               ? KBASE_KMOD_JM_JOB_FRAGMENT
-                                               : KBASE_KMOD_JM_JOB_VERTEX_TILER;
-         if (kbase_kmod_jm_submit_sync(dev->kmod.dev, first_job_desc, type,
-                                       5000000000ll))
-            ret = errno ? errno : EIO;
-         else
-            ret = 0;
-      }
-#else
-      unreachable("kbase support is not compiled");
-#endif
-   } else {
+   else
       ret = pan_kmod_ioctl(panfrost_device_fd(dev), DRM_IOCTL_PANFROST_SUBMIT,
                            &submit);
-   }
    free(bo_handles);
 
    if (ret)
-      return is_kbase_jm ? ret : errno;
+      return errno;
 
    /* Trace the job if we're doing that */
    if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
-      if (!is_kbase_jm) {
-         ret = drmSyncobjWait(panfrost_device_fd(dev), &out_sync, 1, INT64_MAX,
-                              0, NULL);
-         if (ret)
-            return errno;
-      }
+      ret = drmSyncobjWait(panfrost_device_fd(dev), &out_sync, 1, INT64_MAX,
+                           0, NULL);
+      if (ret)
+         return errno;
 
       if (dev->debug & PAN_DBG_TRACE)
          pandecode_jc(dev->decode_ctx, submit.jc, panfrost_device_gpu_id(dev));
@@ -225,7 +196,8 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
       batch->need_job_req_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0;
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (kbase_kmod_dev_is_jm(dev->kmod.dev) && (has_draws || has_frag))
+   bool is_kbase_jm = kbase_kmod_dev_is_jm(dev->kmod.dev);
+   if (is_kbase_jm && (has_draws || has_frag))
       pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 #endif
 
@@ -235,6 +207,78 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
     */
    if (has_tiler)
       pthread_mutex_lock(&dev->submit_lock);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (is_kbase_jm) {
+      if (batch->ctx->in_sync_fd >= 0) {
+         ret = ENOTSUP;
+         goto done;
+      }
+      if (reqs & PANFROST_JD_REQ_CYCLE_COUNT) {
+         ret = ENOTSUP;
+         goto done;
+      }
+
+      if (has_draws || has_frag) {
+         pan_bo_access *flags = util_dynarray_begin(&batch->bos);
+         unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
+         for (unsigned i = 0; i < end_bo; i++) {
+            if (flags[i])
+               panfrost_context_report_bo_access(batch->ctx,
+                                                 pan_lookup_bo(dev, i), flags[i]);
+         }
+      }
+
+      if ((has_draws || has_frag) && !batch->ctx->is_noop) {
+         struct panfrost_kbase_submission *sub =
+            panfrost_kbase_submission_prepare(batch);
+         if (!sub) {
+            ret = ENOMEM;
+            goto done;
+         }
+         uint64_t seqno;
+         if (kbase_kmod_jm_submit(dev->kmod.dev,
+                                  has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
+                                  has_frag ? batch->jm.jobs.frag : 0, &seqno)) {
+            ret = errno ? errno : EIO;
+            batch->ctx->kbase_seqno = UINT64_MAX;
+            if (seqno == UINT64_MAX)
+               panfrost_kbase_submission_enqueue(dev, sub, seqno);
+            else
+               panfrost_kbase_submission_drop(sub);
+            goto done;
+         }
+         panfrost_kbase_submission_enqueue(dev, sub, seqno);
+         batch->ctx->kbase_seqno = seqno;
+         panfrost_kbase_reap(dev);
+      }
+
+      if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
+         if (!batch->ctx->is_noop &&
+             kbase_kmod_jm_wait(dev->kmod.dev, batch->ctx->kbase_seqno,
+                                 INT64_MAX)) {
+            ret = EIO;
+            goto done;
+         }
+         uint64_t jobs[2] = {
+            has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
+            has_frag ? batch->jm.jobs.frag : 0,
+         };
+         for (unsigned i = 0; i < ARRAY_SIZE(jobs); i++) {
+            if (!jobs[i])
+               continue;
+            if (dev->debug & PAN_DBG_TRACE)
+               pandecode_jc(dev->decode_ctx, jobs[i], panfrost_device_gpu_id(dev));
+            if (dev->debug & PAN_DBG_DUMP)
+               pandecode_dump_mappings(dev->decode_ctx);
+            if (!batch->ctx->is_noop && dev->debug & PAN_DBG_SYNC)
+               pandecode_abort_on_fault(dev->decode_ctx, jobs[i],
+                                        panfrost_device_gpu_id(dev));
+         }
+      }
+      goto done;
+   }
+#endif
 
    if (has_draws) {
       ret = jm_submit_jc(batch, batch->jm.jobs.vtc_jc.first_job, reqs,
@@ -830,6 +874,25 @@ jm_emit_malloc_vertex_job(struct panfrost_batch *batch,
          unsigned sz = vs->info.varyings.formats.generic_size_B;
          cfg.vertex_packet_stride = sz + 16;
          cfg.vertex_attribute_stride = sz;
+
+         if (getenv("PAN_MALI_JM_VARYING_TRACE")) {
+            static unsigned traces;
+            if (traces++ < 8) {
+               mesa_logi("pan-jm-varying: generic=%u packet=%u attribute=%u "
+                         "slots=%u",
+                         sz, sz + 16, sz,
+                         vs->info.varyings.formats.count);
+               for (unsigned i = 0; i < vs->info.varyings.formats.count; i++) {
+                  const struct pan_varying_slot *slot =
+                     pan_varying_layout_slot_at(&vs->info.varyings.formats, i);
+                  if (slot)
+                     mesa_logi("pan-jm-varying: slot=%u location=%u section=%u "
+                               "offset=%d comps=%u type=%u",
+                               i, slot->location, slot->section, slot->offset,
+                               slot->ncomps, slot->alu_type);
+               }
+            }
+         }
       } else {
          /* Hardware requirement for "no varyings" */
          cfg.vertex_packet_stride = 16;
@@ -1190,8 +1253,10 @@ GENX(jm_cleanup_context)(struct panfrost_context *ctx)
    struct panfrost_device *dev = pan_device(ctx->base.screen);
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev)) {
+      panfrost_kbase_wait_and_reap(dev, ctx->kbase_seqno);
       return;
+   }
 #endif
 
    if (!ctx->jm.handle) {

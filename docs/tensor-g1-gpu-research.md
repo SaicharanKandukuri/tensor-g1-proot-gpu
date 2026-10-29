@@ -267,3 +267,29 @@ on every presentation. It proves that direct Gallium rendering and drawable
 lifecycle work through Kbase JM, but it is not the final low-copy presentation
 path. Persistent app-managed desktop lifecycle and normal user configuration
 remain untested; the desktop smoke used a temporary isolated home directory.
+
+## Native GL submission comparison (2026-10-29)
+
+On the same Pixel 6a, an isolated, debuggable copy of Android glmark2 2023.01
+ran `terrain` with its default options on a 100×100 surface. A temporary
+`LD_PRELOAD` probe counted `KBASE_IOCTL_JOB_SUBMIT` calls from the
+unchanged `libglmark2-android.so`; the original app remained installed. The
+vendor `libGLES_mali.so` inspected for this experiment has SHA-256
+`5db124c11912414f96980106bd567b7cde6adc63055c72f4dfbd432d2dfd44e7`.
+
+- The probed run reported Mali-G78, 184 frames/s, and 5.435 ms/frame. Its
+  benchmark process reached 27,600 submit calls in about 10.2 seconds. At the
+  last sampled call, the atom-count histogram was 5,743 one-atom calls, 7,139
+  two-atom calls, zero three-atom calls, 283 four-atom calls, and 14,435 calls
+  with at least five atoms. All logged submits used a 64-byte atom stride and
+  returned success; the probe did not check each unsampled result. About 52%
+  of calls carried at least five atoms.
+- The unmodified app, with the same scene defaults and 100×100 surface,
+  reported 169 frames/s in a later control run. Android reported light thermal
+  pressure. This single pair cannot quantify probe overhead or establish a
+  stable native performance baseline.
+- Focused inspection of the vendor binary's embedded debug symbols identifies
+  a GL executor that builds atom arrays, submits them through
+  `base_jd_submit_nofail` / `basep_ioctl_job_submit`, and processes completions
+  separately. This is consistent with the observed multi-atom ioctls; it does
+  not reveal which particular atom chain corresponds to each terrain frame.

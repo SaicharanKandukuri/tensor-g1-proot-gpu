@@ -1648,6 +1648,9 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    xcb_void_cookie_t cookie_pix, cookie_fence;
    if (draw->use_raw_fd_modifier) {
       assert(num_planes == 1);
+      /* Termux:X11 private transports: AHB socket fd or ordinary dma-buf. */
+      const uint64_t transport_modifier =
+         buffer->modifier == 1255 ? buffer->modifier : 1274;
       cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,
                                                         pixmap,
                                                         draw->window,
@@ -1656,7 +1659,8 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                                                         buffer->strides[0], buffer->offsets[0],
                                                         0, 0, 0, 0, 0, 0,
                                                         depth, buffer->cpp * 8,
-                                                        1274, buffer_fds);
+                                                        transport_modifier,
+                                                        buffer_fds);
    } else if (draw->multiplanes_available &&
        buffer->modifier != DRM_FORMAT_MOD_INVALID) {
       cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,

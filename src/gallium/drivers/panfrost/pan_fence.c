@@ -46,6 +46,17 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
    if (fence->signaled)
       return true;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev)) {
+      fence->signaled = !kbase_kmod_jm_wait(
+         dev->kmod.dev, fence->kbase_seqno,
+         timeout > INT64_MAX ? INT64_MAX : timeout);
+      if (fence->signaled)
+         panfrost_kbase_reap(dev);
+      return fence->signaled;
+   }
+#endif
+
    if (!fence->syncobj)
       return false;
 
@@ -134,7 +145,9 @@ panfrost_fence_create(struct panfrost_context *ctx)
          return NULL;
 
       pipe_reference_init(&f->reference, 1);
-      f->signaled = true;
+      f->kbase_seqno = ctx->kbase_seqno;
+      f->signaled = f->kbase_seqno <=
+                    kbase_kmod_jm_completed_seqno(dev->kmod.dev);
       return f;
    }
 #endif

@@ -8,6 +8,7 @@
  */
 
 #include "draw/draw_context.h"
+#include "pan_job.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
@@ -969,6 +970,12 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
 {
    struct panfrost_device *dev = pan_device(pscreen);
    struct panfrost_screen *screen = pan_screen(pscreen);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+      panfrost_kbase_wait_and_reap(
+         dev, kbase_kmod_jm_last_seqno(dev->kmod.dev));
+#endif
 
    panfrost_resource_screen_destroy(pscreen);
    panfrost_pool_cleanup(&screen->mempools.bin);

@@ -152,6 +152,11 @@ struct panfrost_device {
     */
    pthread_mutex_t submit_lock;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   pthread_mutex_t kbase_inflight_lock;
+   struct list_head kbase_inflight;
+#endif
+
    /* Sample positions are preloaded into a write-once constant buffer,
     * such that they can be referenced fore free later. Needed
     * unconditionally on Bifrost, and useful for sharing with Midgard */

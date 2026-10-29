@@ -14,6 +14,7 @@
 #include "pan_bo.h"
 #include "pan_device.h"
 #include "pan_encoder.h"
+#include "pan_job.h"
 #include "pan_samples.h"
 #include "pan_util.h"
 #include "wrap.h"
@@ -146,12 +147,21 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    }
 
    pthread_mutex_init(&dev->submit_lock, NULL);
+#ifdef HAVE_PAN_KMOD_KBASE
+   pthread_mutex_init(&dev->kbase_inflight_lock, NULL);
+   list_inithead(&dev->kbase_inflight);
+#endif
 
    /* Done once on init */
    dev->sample_positions = panfrost_bo_create(
       dev, pan_sample_positions_buffer_size(), 0, "Sample positions");
-   if (!dev->sample_positions)
+   if (!dev->sample_positions) {
+#ifdef HAVE_PAN_KMOD_KBASE
+      pthread_mutex_destroy(&dev->kbase_inflight_lock);
+#endif
+      pthread_mutex_destroy(&dev->submit_lock);
       goto err_free_kmod_dev;
+   }
 
    pan_upload_sample_positions(dev->sample_positions->ptr.cpu);
    return 0;
@@ -178,6 +188,12 @@ panfrost_close_device(struct panfrost_device *dev)
     * we will have early-exited the device open.
     */
    if (dev->model) {
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+         panfrost_kbase_wait_and_reap(
+            dev, kbase_kmod_jm_last_seqno(dev->kmod.dev));
+      pthread_mutex_destroy(&dev->kbase_inflight_lock);
+#endif
       pthread_mutex_destroy(&dev->submit_lock);
       panfrost_bo_unreference(dev->tiler_heap);
       panfrost_bo_unreference(dev->sample_positions);

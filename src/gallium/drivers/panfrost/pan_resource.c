@@ -8,11 +8,15 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include <unistd.h>
 #include <xf86drm.h>
 #include "drm-uapi/drm_fourcc.h"
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
 #include "frontend/winsys_handle.h"
 #include "util/format/u_format.h"
@@ -37,6 +41,216 @@
 #include "pan_tiling.h"
 #include "pan_trace.h"
 #include "pan_util.h"
+#include "tensor_ahb_protocol.h"
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
+static bool
+tensor_ahb_enabled(void)
+{
+   const char *enabled = getenv("PAN_MALI_X11_AHB");
+   return enabled && enabled[0] && strcmp(enabled, "0");
+}
+
+static bool
+tensor_ahb_debug(void)
+{
+   const char *enabled = getenv("PAN_MALI_X11_AHB_DEBUG");
+   return enabled && enabled[0] && strcmp(enabled, "0");
+}
+
+static int
+tensor_ahb_connect(void)
+{
+   const char *path = getenv("TENSOR_AHB_SOCKET");
+   if (!path || !path[0])
+      path = TENSOR_AHB_SOCKET_DEFAULT;
+   if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+      return -1;
+
+   int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+   if (fd < 0)
+      return -1;
+
+   struct sockaddr_un address = {.sun_family = AF_UNIX};
+   strcpy(address.sun_path, path);
+   if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+      close(fd);
+      return -1;
+   }
+
+   return fd;
+}
+
+static bool
+tensor_ahb_exchange(struct tensor_ahb_message *message, int sent_fd,
+                    int *received_fd)
+{
+   if (received_fd)
+      *received_fd = -1;
+
+   int socket_fd = tensor_ahb_connect();
+   if (socket_fd < 0)
+      return false;
+
+   message->magic = TENSOR_AHB_MAGIC;
+   message->version = TENSOR_AHB_VERSION;
+   struct iovec iov = {
+      .iov_base = message,
+      .iov_len = sizeof(*message),
+   };
+   char control[CMSG_SPACE(sizeof(int))] = {0};
+   struct msghdr header = {
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+   };
+   if (sent_fd >= 0) {
+      header.msg_control = control;
+      header.msg_controllen = sizeof(control);
+      struct cmsghdr *cmsg = CMSG_FIRSTHDR(&header);
+      cmsg->cmsg_level = SOL_SOCKET;
+      cmsg->cmsg_type = SCM_RIGHTS;
+      cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(cmsg), &sent_fd, sizeof(sent_fd));
+   }
+
+   ssize_t result;
+   do {
+      result = sendmsg(socket_fd, &header, MSG_NOSIGNAL);
+   } while (result < 0 && errno == EINTR);
+   if (result != (ssize_t)sizeof(*message)) {
+      close(socket_fd);
+      return false;
+   }
+
+   memset(message, 0, sizeof(*message));
+   memset(control, 0, sizeof(control));
+   header.msg_control = control;
+   header.msg_controllen = sizeof(control);
+   do {
+      result = recvmsg(socket_fd, &header, MSG_CMSG_CLOEXEC);
+   } while (result < 0 && errno == EINTR);
+   close(socket_fd);
+
+   int response_fd = -1;
+   for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&header); cmsg;
+        cmsg = CMSG_NXTHDR(&header, cmsg)) {
+      if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+          cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+         memcpy(&response_fd, CMSG_DATA(cmsg), sizeof(response_fd));
+         break;
+      }
+   }
+
+   if (result != (ssize_t)sizeof(*message) ||
+       (header.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) ||
+       message->magic != TENSOR_AHB_MAGIC ||
+       message->version != TENSOR_AHB_VERSION ||
+       message->type != TENSOR_AHB_RESPONSE || message->status) {
+      if (response_fd >= 0)
+         close(response_fd);
+      return false;
+   }
+
+   if (received_fd) {
+      *received_fd = response_fd;
+   } else if (response_fd >= 0)
+      close(response_fd);
+
+   return true;
+}
+
+static void
+tensor_ahb_release(uint32_t id)
+{
+   if (!id)
+      return;
+
+   struct tensor_ahb_message message = {
+      .type = TENSOR_AHB_RELEASE,
+      .id = id,
+   };
+   if (tensor_ahb_exchange(&message, -1, NULL) && tensor_ahb_debug())
+      mesa_logi("tensor-ahb: Mesa release id=%u", id);
+}
+
+static bool
+tensor_ahb_allocate(struct panfrost_resource *resource,
+                    const struct pipe_resource *template, int *dma_buf_fd)
+{
+   const bool compatible_format =
+      template->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+      template->format == PIPE_FORMAT_B8G8R8X8_UNORM;
+   if (!tensor_ahb_enabled() || template->target != PIPE_TEXTURE_2D ||
+       template->last_level || template->depth0 != 1 ||
+       template->array_size != 1 || template->nr_samples > 1 ||
+       !compatible_format || resource->modifier != DRM_FORMAT_MOD_LINEAR)
+      return false;
+
+   struct tensor_ahb_message message = {
+      .type = TENSOR_AHB_ALLOCATE,
+      .width = template->width0,
+      .height = template->height0,
+      .format = 5,
+   };
+   int fd = -1;
+   struct stat fd_status;
+   if (!tensor_ahb_exchange(&message, -1, &fd) || fd < 0 ||
+       message.width != template->width0 ||
+       message.height != template->height0 || message.format != 5 ||
+       message.stride < template->width0 || message.stride > UINT32_MAX / 4 ||
+       message.data_size < message.stride * 4ull * message.height ||
+       fstat(fd, &fd_status) < 0 || fd_status.st_size != message.data_size) {
+      if (fd >= 0)
+         close(fd);
+      tensor_ahb_release(message.id);
+      return false;
+   }
+
+   const uint32_t row_stride = message.stride * 4;
+   struct pan_image_layout *layout = &resource->plane.layout;
+   struct pan_image_slice_layout *slice = &layout->slices[0];
+   const uint64_t surface_size = (uint64_t)row_stride * message.height;
+   slice->size_B = surface_size;
+   slice->tiled_or_linear.row_stride_B = row_stride;
+   slice->tiled_or_linear.surface_stride_B = surface_size;
+   memset(&slice->crc, 0, sizeof(slice->crc));
+   resource->image.props.crc = false;
+   pan_crc_state_invalidate(&resource->crc_state);
+   layout->array_stride_B = surface_size;
+   layout->data_size_B = message.data_size;
+   resource->tensor_ahb_id = message.id;
+   *dma_buf_fd = fd;
+
+   if (tensor_ahb_debug())
+      mesa_logi("tensor-ahb: Mesa allocation id=%u %ux%u stride=%u size=%u",
+                message.id, message.width, message.height, row_stride,
+                message.data_size);
+
+   return true;
+}
+
+static int
+tensor_ahb_present_fd(uint32_t id)
+{
+   int sockets[2];
+   if (!id || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0)
+      return -1;
+
+   struct tensor_ahb_message message = {
+      .type = TENSOR_AHB_PRESENT,
+      .id = id,
+   };
+   bool success = tensor_ahb_exchange(&message, sockets[1], NULL);
+   close(sockets[1]);
+   if (!success) {
+      close(sockets[0]);
+      return -1;
+   }
+
+   return sockets[0];
+}
 
 static uint64_t
 panfrost_max_res_size_b(unsigned arch)
@@ -210,6 +424,8 @@ panfrost_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
       }
       panfrost_bo_unreference(rsrc->bo);
    }
+
+   tensor_ahb_release(rsrc->tensor_ahb_id);
 
    pan_resource_afbcp_stop(rsrc);
 
@@ -476,7 +692,8 @@ panfrost_resource_get_handle(struct pipe_screen *pscreen,
 
    scanout = rsrc->scanout;
 
-   handle->modifier = rsrc->modifier;
+   handle->modifier =
+      rsrc->tensor_ahb_id ? TENSOR_AHB_DRI3_MODIFIER : rsrc->modifier;
    rsrc->modifier_constant = true;
 
    if (handle->type == WINSYS_HANDLE_TYPE_KMS && dev->ro) {
@@ -484,7 +701,8 @@ panfrost_resource_get_handle(struct pipe_screen *pscreen,
    } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
       handle->handle = panfrost_bo_handle(rsrc->bo);
    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
-      int fd = panfrost_bo_export(rsrc->bo);
+      int fd = rsrc->tensor_ahb_id ? tensor_ahb_present_fd(rsrc->tensor_ahb_id)
+                                   : panfrost_bo_export(rsrc->bo);
 
       if (fd < 0)
          return false;
@@ -497,6 +715,13 @@ panfrost_resource_get_handle(struct pipe_screen *pscreen,
 
    handle->stride = pan_image_get_wsi_row_pitch(&rsrc->image, handle->plane, 0);
    handle->offset = pan_image_get_wsi_offset(&rsrc->image, handle->plane, 0);
+
+   if (tensor_ahb_debug() && handle->type == WINSYS_HANDLE_TYPE_FD)
+      mesa_logi("tensor-ahb: export resource=%p id=%u fd=%d modifier=%llu "
+                "stride=%u offset=%u",
+                (void *)rsrc, rsrc->tensor_ahb_id, handle->handle,
+                (unsigned long long)handle->modifier, handle->stride,
+                handle->offset);
 
    /* SW detiling on MTK_TILED resources. This forces us to treat such
     * resources as linear images with:
@@ -543,7 +768,7 @@ panfrost_resource_get_param(struct pipe_screen *pscreen,
       *value = pan_image_get_wsi_offset(&rsrc->image, plane, level);
       return true;
    case PIPE_RESOURCE_PARAM_MODIFIER:
-      *value = rsrc->modifier;
+      *value = rsrc->tensor_ahb_id ? TENSOR_AHB_DRI3_MODIFIER : rsrc->modifier;
       return true;
    case PIPE_RESOURCE_PARAM_NPLANES:
       *value = util_resource_num(prsc);
@@ -556,7 +781,17 @@ panfrost_resource_get_param(struct pipe_screen *pscreen,
 static void
 panfrost_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
 {
-   /* TODO */
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct panfrost_context *ctx = pan_context(pctx);
+   struct panfrost_device *dev = pan_device(pctx->screen);
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev)) {
+      struct panfrost_resource *rsrc = pan_resource(prsc);
+      panfrost_flush_writer(ctx, rsrc, "Kbase resource flush");
+      if (!panfrost_resource_wait(rsrc, ctx, INT64_MAX, true))
+         mesa_loge("panfrost: kbase resource completion failed");
+      panfrost_kbase_reap(dev);
+   }
+#endif
 }
 
 static inline bool
@@ -1092,7 +1327,25 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 
    panfrost_resource_setup(screen, so, modifier, template->format, plane_idx);
 
-   if (dev->ro && (template->bind & PIPE_BIND_SCANOUT)) {
+   int ahb_fd = -1;
+   bool ahb_device = false;
+#ifdef HAVE_PAN_KMOD_KBASE
+   ahb_device = !dev->ro && kbase_kmod_dev_is_jm(dev->kmod.dev);
+#endif
+   if (ahb_device &&
+       (template->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT)) &&
+       tensor_ahb_allocate(so, template, &ahb_fd)) {
+      int ret = panfrost_resource_import_bo(so, dev, ahb_fd);
+      close(ahb_fd);
+      if (ret) {
+         mesa_loge("Panfrost AHardwareBuffer Kbase import failed");
+         panfrost_resource_destroy(screen, &so->base);
+         return NULL;
+      }
+
+      so->plane.base = so->bo->ptr.gpu;
+      so->constant_stencil = true;
+   } else if (dev->ro && (template->bind & PIPE_BIND_SCANOUT)) {
       struct winsys_handle handle;
 
       /* Block-based texture formats are only used for texture
@@ -1434,6 +1687,11 @@ panfrost_resource_wait(struct panfrost_resource *rsrc,
                        struct panfrost_context *ctx, int64_t timeout_ns,
                        bool wait_readers)
 {
+#ifdef HAVE_PAN_KMOD_KBASE
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev))
+      return panfrost_bo_wait(rsrc->bo, timeout_ns, wait_readers);
+#endif
    /* The BO is shared, we have to do a KMD wait. */
    if (rsrc->bo->flags & PAN_BO_SHARED)
       return panfrost_bo_wait(rsrc->bo, timeout_ns, wait_readers);
