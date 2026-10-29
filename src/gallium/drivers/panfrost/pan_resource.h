@@ -57,6 +57,9 @@ struct panfrost_resource {
 
    struct renderonly_scanout *scanout;
 
+   /* The Bionic broker owns this resource's Android AHardwareBuffer. */
+   uint32_t tensor_ahb_id;
+
    struct panfrost_resource *separate_stencil;
 
    /* image created when detiling a resource whose

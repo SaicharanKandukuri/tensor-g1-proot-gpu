@@ -70,6 +70,12 @@ panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    /* Submit all pending jobs */
    panfrost_flush_all_batches(ctx, "Gallium flush");
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_kmod_dev_is_jm(dev->kmod.dev) &&
+       (flags & PIPE_FLUSH_END_OF_FRAME))
+      panfrost_kbase_wait_and_reap(dev, ctx->kbase_seqno);
+#endif
+
    if (fence) {
       struct pipe_fence_handle *f = panfrost_fence_create(ctx);
       pipe->screen->fence_reference(pipe->screen, fence, NULL);

@@ -13,6 +13,9 @@ struct pipe_fence_handle {
    struct pipe_reference reference;
    uint32_t syncobj;
    bool signaled;
+#ifdef HAVE_PAN_KMOD_KBASE
+   uint64_t kbase_seqno;
+#endif
 };
 
 void panfrost_fence_reference(struct pipe_screen *pscreen,

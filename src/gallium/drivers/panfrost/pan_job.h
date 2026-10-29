@@ -29,6 +29,20 @@
 
 typedef uint8_t pan_bo_access;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+struct panfrost_batch;
+struct panfrost_kbase_submission;
+struct panfrost_device;
+struct panfrost_kbase_submission *
+panfrost_kbase_submission_prepare(struct panfrost_batch *batch);
+void panfrost_kbase_submission_drop(struct panfrost_kbase_submission *sub);
+void panfrost_kbase_submission_enqueue(struct panfrost_device *dev,
+                                       struct panfrost_kbase_submission *sub,
+                                       uint64_t seqno);
+void panfrost_kbase_reap(struct panfrost_device *dev);
+void panfrost_kbase_wait_and_reap(struct panfrost_device *dev, uint64_t seqno);
+#endif
+
 /* A panfrost_batch corresponds to a bound FBO we're rendering to,
  * collecting over multiple draws. */
 

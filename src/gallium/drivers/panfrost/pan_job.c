@@ -6,6 +6,8 @@
  */
 
 #include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #include "util/format/u_format.h"
 #include "util/hash_table.h"
@@ -18,8 +20,107 @@
 #include "pan_trace.h"
 #include "pan_util.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+
 #define foreach_batch(ctx, idx)                                                \
    BITSET_FOREACH_SET(idx, ctx->batches.active, PAN_MAX_BATCHES)
+
+#ifdef HAVE_PAN_KMOD_KBASE
+struct panfrost_kbase_submission {
+   struct list_head link;
+   uint64_t seqno;
+   unsigned count;
+   struct panfrost_bo *bos[];
+};
+
+struct panfrost_kbase_submission *
+panfrost_kbase_submission_prepare(struct panfrost_batch *batch)
+{
+   struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
+   unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
+   size_t capacity = (size_t)batch->num_bos +
+                     panfrost_pool_num_bos(&batch->pool) +
+                     panfrost_pool_num_bos(&batch->invisible_pool);
+   if (capacity > (SIZE_MAX - sizeof(struct panfrost_kbase_submission)) /
+                     sizeof(struct panfrost_bo *))
+      return NULL;
+   struct panfrost_kbase_submission *sub =
+      malloc(sizeof(*sub) + capacity * sizeof(sub->bos[0]));
+   if (!sub)
+      return NULL;
+   sub->count = 0;
+
+   util_dynarray_foreach(&batch->pool.bos, struct panfrost_bo *, bo) {
+      panfrost_bo_reference(*bo);
+      sub->bos[sub->count++] = *bo;
+   }
+   util_dynarray_foreach(&batch->invisible_pool.bos, struct panfrost_bo *, bo) {
+      panfrost_bo_reference(*bo);
+      sub->bos[sub->count++] = *bo;
+   }
+   pan_bo_access *flags = util_dynarray_begin(&batch->bos);
+   for (unsigned i = 0; i < end_bo; i++) {
+      if (flags[i]) {
+         struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+         panfrost_bo_reference(bo);
+         sub->bos[sub->count++] = bo;
+      }
+   }
+   assert(sub->count <= capacity);
+   return sub;
+}
+
+void
+panfrost_kbase_submission_drop(struct panfrost_kbase_submission *sub)
+{
+   for (unsigned i = 0; i < sub->count; i++)
+      panfrost_bo_unreference(sub->bos[i]);
+   free(sub);
+}
+
+void
+panfrost_kbase_submission_enqueue(struct panfrost_device *dev,
+                                  struct panfrost_kbase_submission *sub,
+                                  uint64_t seqno)
+{
+   sub->seqno = seqno;
+   pthread_mutex_lock(&dev->kbase_inflight_lock);
+   list_addtail(&sub->link, &dev->kbase_inflight);
+   pthread_mutex_unlock(&dev->kbase_inflight_lock);
+}
+
+void
+panfrost_kbase_reap(struct panfrost_device *dev)
+{
+   uint64_t completed = kbase_kmod_jm_completed_seqno(dev->kmod.dev);
+   struct list_head retired;
+   list_inithead(&retired);
+   pthread_mutex_lock(&dev->kbase_inflight_lock);
+   list_for_each_entry_safe(struct panfrost_kbase_submission, sub,
+                            &dev->kbase_inflight, link) {
+      if (sub->seqno <= completed) {
+         list_del(&sub->link);
+         list_addtail(&sub->link, &retired);
+      }
+   }
+   pthread_mutex_unlock(&dev->kbase_inflight_lock);
+   list_for_each_entry_safe(struct panfrost_kbase_submission, sub,
+                            &retired, link) {
+      list_del(&sub->link);
+      panfrost_kbase_submission_drop(sub);
+   }
+}
+
+void
+panfrost_kbase_wait_and_reap(struct panfrost_device *dev, uint64_t seqno)
+{
+   if (kbase_kmod_jm_wait(dev->kmod.dev, seqno, INT64_MAX))
+      mesa_loge("panfrost: kbase JM completion failed");
+   panfrost_kbase_reap(dev);
+}
+#endif
 
 static unsigned
 panfrost_batch_idx(struct panfrost_batch *batch)
